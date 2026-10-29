@@ -1,0 +1,3543 @@
+diff --git a/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt b/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
+index c419c67..59be321 100644
+--- a/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
++++ b/app/src/main/java/com/droiddeck/launcher/FrontEndActivity.kt
+@@ -1350,9 +1350,18 @@ class FrontEndActivity : ComponentActivity() {
+                     onDismiss = { showRoms = false },
+                 )
+                 showNonAdreno?.let { release ->
++                    // The gate is no longer "is this an Adreno" but "will this draw on the CPU",
++                    // so the card says what will actually happen rather than what the GPU is not.
++                    val softwareOnly = com.droiddeck.launcher.core.DeviceSupport.needsGpuWarning(this@FrontEndActivity)
+                     ConfirmDialog(
+-                        title = androidx.compose.ui.res.stringResource(R.string.main_non_adreno_title),
+-                        text = androidx.compose.ui.res.stringResource(R.string.main_non_adreno_text, com.droiddeck.launcher.core.DeviceSupport.gpuName(this@FrontEndActivity), release.size / 1e6),
++                        title = androidx.compose.ui.res.stringResource(
++                            if (softwareOnly) R.string.main_software_render_title else R.string.main_non_adreno_title
++                        ),
++                        text = androidx.compose.ui.res.stringResource(
++                            if (softwareOnly) R.string.main_software_render_text else R.string.main_non_adreno_text,
++                            com.droiddeck.launcher.core.DeviceSupport.gpuName(this@FrontEndActivity),
++                            release.size / 1e6,
++                        ),
+                         confirm = androidx.compose.ui.res.stringResource(R.string.main_install_anyway),
+                         onConfirm = { showNonAdreno = null; install(release) },
+                         onDismiss = { showNonAdreno = null },
+@@ -2431,7 +2440,7 @@ class FrontEndActivity : ComponentActivity() {
+             Thread({ checkCatalog() }, "catalog").start()
+             return
+         }
+-        if (installed == null && !com.droiddeck.launcher.core.DeviceSupport.adreno()) { showNonAdreno = release; return }
++        if (installed == null && com.droiddeck.launcher.core.DeviceSupport.needsGpuWarning(this)) { showNonAdreno = release; return }
+         install(release)
+     }
+ 
+@@ -2446,7 +2455,7 @@ class FrontEndActivity : ComponentActivity() {
+             showPhantomGate = true
+             return false
+         }
+-        val warn = installed == null && !com.droiddeck.launcher.core.DeviceSupport.adreno()
++        val warn = installed == null && com.droiddeck.launcher.core.DeviceSupport.needsGpuWarning(this)
+         if (warn && available != null) { showNonAdreno = available; return false }
+         startActivity(intent)
+         return true
+diff --git a/app/src/main/java/com/droiddeck/launcher/core/DeviceReport.kt b/app/src/main/java/com/droiddeck/launcher/core/DeviceReport.kt
+index 4163eb4..d0526c3 100644
+--- a/app/src/main/java/com/droiddeck/launcher/core/DeviceReport.kt
++++ b/app/src/main/java/com/droiddeck/launcher/core/DeviceReport.kt
+@@ -189,6 +189,33 @@ object DeviceReport {
+         k("KGSL chip id", readSys("/sys/class/kgsl/kgsl-3d0/gpu_chipid"))
+         k("System Vulkan ICD", if (File("/vendor/lib64/hw/vulkan.adreno.so").exists()) "/vendor/lib64/hw/vulkan.adreno.so" else "not at the usual path")
+ 
++        // What the backend layer concluded, in full. This block is the one thing a report from a
++        // device nobody here owns has to carry: on a Kirin there is no kgsl node to read, so without
++        // it the section above would say "unknown" three times and explain nothing.
++        h("GPU backend")
++        runCatching {
++            val probe = com.droiddeck.launcher.gpu.probe.GpuBackends.probe()
++            val policy = com.droiddeck.launcher.gpu.probe.GpuBackends.policy(context)
++            val decision = com.droiddeck.launcher.gpu.probe.BackendRegistry.select(probe, policy)
++            k("Vendor", probe.vendor.label)
++            k("Device", probe.deviceName)
++            probe.kirin?.let { k("SoC", "${it.marketing} · ${it.gpu} · ${it.era.label}") }
++            k("kbase", probe.kbase.label)
++            k("Kernel node", probe.kernelNode ?: "none")
++            k("Vendor driver", probe.driverLib ?: "not at a known path")
++            k("Policy", policy.name)
++            k("Backend", "${decision.chosen.displayName} [${decision.chosen.risk.name}]")
++            k("  why", decision.chosen.reason)
++            k("GPU in guest", if (decision.chosen.gpuInGuest) "yes" else "no (software)")
++            k("  binds", decision.chosen.binds.ifEmpty { listOf("none") }.joinToString(", "))
++            for ((key, value) in decision.chosen.env) k("  env $key", value)
++            for ((key, value) in decision.chosen.dxvk) k("  dxvk $key", value)
++            k("HarmonyOS", com.droiddeck.launcher.gpu.probe.GpuBackends.harmonyOs().label().ifEmpty { "not a HarmonyOS device" })
++            com.droiddeck.launcher.gpu.probe.DeviceProfiles.forProbe(probe, CpuCores.all.size)?.let { tuning ->
++                k("Tuning", "${tuning.label} · ${tuning.resolutionScalePercent}% · ${tuning.maxRefreshHz} Hz")
++            }
++        }.onFailure { k("GPU backend", "probe failed: ${it.message}") }
++
+         h("Display")
+         k("Session output", SessionState.outputSize?.let { "${it.first}x${it.second}" })
+         k("Session refresh", String.format(Locale.US, "%.2f Hz", SessionState.refreshHz))
+diff --git a/app/src/main/java/com/droiddeck/launcher/core/DeviceSupport.kt b/app/src/main/java/com/droiddeck/launcher/core/DeviceSupport.kt
+index 325ed7d..e69efff 100644
+--- a/app/src/main/java/com/droiddeck/launcher/core/DeviceSupport.kt
++++ b/app/src/main/java/com/droiddeck/launcher/core/DeviceSupport.kt
+@@ -3,12 +3,70 @@ package com.droiddeck.launcher.core
+ import android.content.Context
+ import android.os.Build
+ import com.droiddeck.launcher.R
++import com.droiddeck.launcher.gpu.probe.BackendRegistry
++import com.droiddeck.launcher.gpu.probe.GpuBackends
++import com.droiddeck.launcher.gpu.probe.GpuVendor
++import com.droiddeck.launcher.gpu.probe.KirinSoc
++import com.droiddeck.launcher.gpu.probe.Risk
+ import java.io.File
+ 
++/**
++ * Whether this device can draw a Linux session, and with what.
++ *
++ * The runtime draws with Turnip, an Adreno driver. On anything else the compositor gets no usable
++ * Vulkan device and a session comes up as sound over a black screen - a failure with nothing in it
++ * to read. So the question "is this an Adreno" was, until now, the whole answer.
++ *
++ * It no longer is. A Kirin 9000 and older carries ARM Mali, which an imported PanVK-kbase driver can
++ * drive; a Kirin 9000S and newer carries Huawei's Maleoon, which nothing open can drive, but which
++ * can still run a session on the CPU. Both are answers, and neither is "no". What decides is the
++ * backend registry, not a brand check - [adreno] stays as it was because the Adreno path must not
++ * change behaviour just because other vendors were added beside it.
++ */
+ object DeviceSupport {
+     fun adreno(): Boolean =
+         File("/sys/class/kgsl/kgsl-3d0").exists() || File("/vendor/lib64/hw/vulkan.adreno.so").exists()
+ 
++    /** ARM Mali: a licensed Mali GPU, which is what a Kirin 9000 or older has. */
++    @JvmStatic
++    fun mali(): Boolean = GpuBackends.probe().vendor == GpuVendor.ARM_MALI
++
++    /** Huawei Maleoon: Kirin 9000S, 9010 and 9020. */
++    @JvmStatic
++    fun maleoon(): Boolean = GpuBackends.probe().vendor == GpuVendor.HUAWEI_MALEOON
++
++    /** The Kirin SoC this device is, or null when it is not a Kirin at all. */
++    @JvmStatic
++    fun kirin(): KirinSoc? = GpuBackends.probe().kirin
++
++    /**
++     * Whether a session can start at all.
++     *
++     * True on every device now: a GPU that no backend can drive still gets CPU rendering, and a
++     * session that runs slowly is better than a card that refuses to start one. Kept as a function
++     * rather than deleted because the launcher still asks, and the answer is what it acts on.
++     */
++    @JvmStatic
++    fun renderable(): Boolean =
++        BackendRegistry.select(GpuBackends.probe()).chosen.risk != Risk.BLOCKED
++
++    /**
++     * Whether starting a session here has to explain itself first.
++     *
++     * Adreno needs no explanation: it is the validated path. Everything else does, because the
++     * session will draw on the CPU - and a user who finds that out after a 3 GB download has been
++     * told the wrong thing at the wrong moment.
++     *
++     * This replaces the old "is this an Adreno" gate. The question was never whether the GPU is
++     * Qualcomm's; it is whether anything here can draw, and what it will cost.
++     */
++    @JvmStatic
++    fun needsGpuWarning(context: Context): Boolean {
++        val probe = GpuBackends.probe()
++        if (probe.isAdreno) return false
++        return GpuBackends.decide(probe, GpuBackends.policy(context)).software
++    }
++
+     fun gpuName(context: Context): String {
+         val soc = if (Build.VERSION.SDK_INT >= 31) Build.SOC_MODEL.takeIf { it.isNotBlank() && it != Build.UNKNOWN } else null
+         return soc?.let { "$it (${Build.HARDWARE})" } ?: Build.HARDWARE.ifBlank { context.getString(R.string.gpu_this_gpu) }
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/DriverBundle.kt b/app/src/main/java/com/droiddeck/launcher/gpu/DriverBundle.kt
+index db8dc86..151d9ac 100644
+--- a/app/src/main/java/com/droiddeck/launcher/gpu/DriverBundle.kt
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/DriverBundle.kt
+@@ -76,10 +76,10 @@ object DriverBundle {
+             val linuxStage = lm.newStagingDir()
+             val linuxId = try {
+                 val library = linuxDir.listFiles()?.firstOrNull { it.isFile && it.name.startsWith("libvulkan_freedreno") && it.name.endsWith(".so") }
+-                library?.copyTo(File(linuxStage, LinuxVulkanDriverManager.LIB_NAME))
++                val staged = library?.copyTo(File(linuxStage, LinuxVulkanDriverManager.LIB_NAME), overwrite = true)
+                 val meta = File(linuxDir, LinuxVulkanDriverManager.META_NAME).takeIf { it.isFile }
+                     ?.let { runCatching { JSONObject(FileUtils.readString(it)) }.getOrNull() }
+-                lm.adopt(linuxStage, library?.name, meta, manifest.name)
++                lm.adopt(linuxStage, staged, library?.name, meta, manifest.name)
+             } catch (e: Exception) {
+                 FileUtils.delete(linuxStage)
+                 throw e
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/GpuInfo.kt b/app/src/main/java/com/droiddeck/launcher/gpu/GpuInfo.kt
+index 652d33f..d2255d9 100644
+--- a/app/src/main/java/com/droiddeck/launcher/gpu/GpuInfo.kt
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/GpuInfo.kt
+@@ -4,27 +4,57 @@ import android.content.Context
+ import android.os.Build
+ import com.droiddeck.launcher.R
+ import com.droiddeck.launcher.core.FileUtils
++import com.droiddeck.launcher.gpu.probe.GpuBackends
++import com.droiddeck.launcher.gpu.probe.GpuProbeResult
++import com.droiddeck.launcher.gpu.probe.GpuVendor
+ import java.io.File
+ 
++/**
++ * What GPU this is, in the terms the driver lists are sorted by.
++ *
++ * KGSL names the model ("Adreno740v2", "Adreno825"); the family decides which Turnip builds run on it
++ * at all, and the support level is what the app has actually been tested on (Adreno 650, 725 and
++ * newer) - an Adreno 610 may start, but it is not "supported" just because it is a Qualcomm chip.
++ *
++ * Non-Qualcomm parts carry their own families now, and are named by their vendor rather than folded
++ * into "not an Adreno": a Kirin 9000 is ARM Mali and can run with an imported driver, a Kirin 9000S
++ * is Maleoon and can only run on the CPU. Both are useful answers, and the driver lists and the
++ * support card need to tell them apart.
++ */
+ data class GpuInfo(
++    /** "Adreno 740", or the vendor's own name when this is not an Adreno. */
+     val name: String,
++    /** The three-digit Adreno model (740, 825), or 0 when KGSL does not say. */
+     val model: Int,
+     val family: Family,
++    /** The SoC as a person would say it ("Snapdragon 8 Gen 2 (QCS8550)"), or "" when the phone does not say. */
+     val soc: String,
++    /** Samsung's One UI on an 8 Gen 2: its Turnip needs the OneUI build, or frames tear and flicker. */
+     val oneUi8Gen2: Boolean,
++    /** KGSL's own name for the GPU, as the kernel spells it ("Adreno740v2", "Adreno33v2"). */
+     val kgslName: String = "",
++    /** Where [model] came from: "kernel", "vulkan" or "platform", "" when unknown. */
+     val modelSource: String = "",
+     val kgslChipId: String = "",
+     val platformGpuModel: Int = 0,
++    /** Who makes it. Defaults to Qualcomm so every existing construction still means what it meant. */
++    val vendor: GpuVendor = GpuVendor.QUALCOMM,
+ ) {
+     enum class Family(val label: String) {
+         A8XX("Adreno 8xx"),
++        /** Adreno 710/720/722: gen 7 cores cut down enough to need their own patches. */
+         A7XX_LOW("Adreno 710/720/722"),
+         A7XX("Adreno 7xx"),
+         A6XX("Adreno 6xx"),
++        /** An Adreno whose model KGSL does not give: treated as the newest family it could be. */
+         ADRENO_UNKNOWN("Adreno"),
++        /** ARM's licensed Mali, as on a Kirin 9000 and older. PanVK can be made to drive it. */
++        MALI("ARM Mali"),
++        /** Huawei's own GPU, as on a Kirin 9000S and newer. Nothing open drives it. */
++        MALEOON("Huawei Maleoon"),
+         NOT_ADRENO("Not an Adreno GPU");
+ 
++        /** [label] in the app's language: the Adreno families are names, the rest is words. */
+         fun label(context: Context): String = if (this == NOT_ADRENO) context.getString(R.string.gpuinfo_not_adreno) else label
+     }
+ 
+@@ -34,6 +64,9 @@ data class GpuInfo(
+ 
+     val support: Support
+         get() = when {
++            // Mali runs, but on a driver the user imports and nobody has validated for Steam here.
++            family == Family.MALI -> Support.UNTESTED
++            family == Family.MALEOON -> Support.UNSUPPORTED
+             family == Family.NOT_ADRENO -> Support.UNSUPPORTED
+             isA850 -> Support.UNTESTED
+             family == Family.A6XX && model == 650 -> Support.TESTED
+@@ -42,23 +75,37 @@ data class GpuInfo(
+             else -> Support.UNTESTED
+         }
+ 
++    /** One line for the device card and the system check, in English for the device report. */
+     val supportText: String
+         get() = when (support) {
+             Support.TESTED -> "Supported"
+-            Support.UNTESTED -> if (isA850) "Experimental Adreno 850 support: requires compatible experimental display and game drivers; not verified on this device"
+-                else if (family == Family.A7XX_LOW) "Experimental: its drivers are test builds"
+-                else "Outside tested hardware (Adreno 650, 725 and newer): it may not run"
+-            Support.UNSUPPORTED -> "Not supported: DroidDeck needs an Adreno (Snapdragon) GPU"
++            Support.UNTESTED -> when {
++                family == Family.MALI -> "Experimental ARM Mali (Kirin 9000 and older): needs an imported " +
++                    "PanVK-kbase driver, and Steam is not validated on this device"
++                isA850 -> "Experimental Adreno 850 support: requires compatible experimental display and game drivers; not verified on this device"
++                family == Family.A7XX_LOW -> "Experimental: its drivers are test builds"
++                else -> "Outside tested hardware (Adreno 650, 725 and newer): it may not run"
++            }
++            Support.UNSUPPORTED -> when {
++                family == Family.MALEOON ->
++                    "Huawei Maleoon (Kirin 9000S and newer) has no Linux driver: sessions can run, but only with CPU rendering"
++                else -> "Not supported: DroidDeck needs an Adreno (Snapdragon) GPU"
++            }
+         }
+ 
+-    fun supportText(context: Context): String = context.getString(when (support) {
+-        Support.TESTED -> R.string.gpuinfo_supported
+-        Support.UNTESTED -> when {
+-            isA850 -> R.string.gpuinfo_a850_experimental
+-            family == Family.A7XX_LOW -> R.string.gpuinfo_experimental
+-            else -> R.string.gpuinfo_below_tested
++    /** [supportText] in the app's language. */
++    fun supportText(context: Context): String = context.getString(when {
++        family == Family.MALI -> R.string.gpuinfo_mali_experimental
++        family == Family.MALEOON -> R.string.gpuinfo_maleoon_software
++        else -> when (support) {
++            Support.TESTED -> R.string.gpuinfo_supported
++            Support.UNTESTED -> when {
++                isA850 -> R.string.gpuinfo_a850_experimental
++                family == Family.A7XX_LOW -> R.string.gpuinfo_experimental
++                else -> R.string.gpuinfo_below_tested
++            }
++            Support.UNSUPPORTED -> R.string.gpuinfo_unsupported
+         }
+-        Support.UNSUPPORTED -> R.string.gpuinfo_unsupported
+     })
+ 
+     fun displayName(context: Context): String = if (name == UNNAMED) context.getString(R.string.gpu_this_gpu) else name
+@@ -66,28 +113,55 @@ data class GpuInfo(
+     companion object {
+         private const val UNNAMED = "this GPU"
+ 
++        /**
++         * Detect from the device itself.
++         *
++         * Adreno keeps the probe it always had, down to where the model number came from, because
++         * every driver list in the app is keyed on it. Everything else is described by the backend
++         * probe, which is the only thing that knows a Mali from a Maleoon.
++         */
+         fun detect(): GpuInfo {
+-            val adreno = File("/sys/class/kgsl/kgsl-3d0").exists() || File("/vendor/lib64/hw/vulkan.adreno.so").exists()
++            val probe = GpuBackends.probe()
++            return when (probe.vendor) {
++                GpuVendor.QUALCOMM -> adreno(probe)
++                GpuVendor.ARM_MALI -> nonAdreno(probe, Family.MALI, probe.deviceName)
++                GpuVendor.HUAWEI_MALEOON -> nonAdreno(probe, Family.MALEOON, probe.deviceName)
++                // Xclipse, PowerVR and anything unnamed stay NOT_ADRENO: it is the family the app
++                // has always used to mean "nothing here can drive it", and every caller already
++                // handles it. A new family for the same fact would only add a case to each of them.
++                else -> nonAdreno(probe, Family.NOT_ADRENO, probe.deviceName)
++            }
++        }
++
++        private fun adreno(probe: GpuProbeResult): GpuInfo {
+             val raw = FileUtils.readString(File("/sys/class/kgsl/kgsl-3d0/gpu_model"))?.trim()
+             val chipId = FileUtils.readString(File("/sys/class/kgsl/kgsl-3d0/gpu_chipid"))?.trim().orEmpty()
+-            val soc = if (adreno) SocNames.label() else ""
+-            val platformGpuModel = if (adreno) platformModel() else 0
+-            val (model, source) = if (adreno) modelFromNames(
++            val platformGpuModel = platformModel()
++            val (model, source) = modelFromNames(
+                 raw,
+                 { VulkanInfo.cachedOrNull()?.get("device") },
+                 { platformGpuModel },
+-            ) else 0 to ""
+-            val family = familyOf(adreno, model)
++            ).let { if (it.first > 0) it else probe.adrenoModel to "probe" }
+             val samsung = Build.MANUFACTURER.equals("samsung", ignoreCase = true)
+             return GpuInfo(
+-                name = if (!adreno) Build.HARDWARE.ifBlank { UNNAMED } else if (model > 0) "Adreno $model" else "Adreno",
+-                model = model, family = family, soc = soc,
++                name = if (model > 0) "Adreno $model" else "Adreno",
++                model = model, family = familyOf(true, model), soc = SocNames.label(),
+                 oneUi8Gen2 = samsung && model == 740,
+                 kgslName = raw.orEmpty(), modelSource = source, kgslChipId = chipId,
+                 platformGpuModel = platformGpuModel,
++                vendor = GpuVendor.QUALCOMM,
+             )
+         }
+ 
++        private fun nonAdreno(probe: GpuProbeResult, family: Family, name: String): GpuInfo = GpuInfo(
++            name = name.ifBlank { UNNAMED },
++            model = 0,
++            family = family,
++            soc = probe.kirin?.let { "${it.marketing} (${it.gpu})" } ?: SocNames.label(),
++            oneUi8Gen2 = false,
++            vendor = probe.vendor,
++        )
++
+         internal fun threeDigits(text: String): Int = Regex("""(?i)\badreno\s*(?:\(TM\)\s*)?(\d{3})(?!\d)""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+ 
+         internal fun modelFromNames(
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/LinuxVulkanDriverManager.java b/app/src/main/java/com/droiddeck/launcher/gpu/LinuxVulkanDriverManager.java
+index 3973297..8a0154a 100644
+--- a/app/src/main/java/com/droiddeck/launcher/gpu/LinuxVulkanDriverManager.java
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/LinuxVulkanDriverManager.java
+@@ -18,7 +18,9 @@ import java.nio.file.Files;
+ import java.nio.file.StandardCopyOption;
+ import java.util.ArrayList;
+ import java.util.Collections;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.zip.ZipEntry;
+ import java.util.zip.ZipInputStream;
+ 
+@@ -45,7 +47,31 @@ public class LinuxVulkanDriverManager {
+     public boolean isInstalled(String id) {
+         if (id == null || id.isEmpty() || id.contains("/") || id.contains("..")) return false;
+         File dir = getDriverDir(id);
+-        return new File(dir, LIB_NAME).isFile() && new File(dir, ICD_NAME).isFile();
++        if (!new File(dir, ICD_NAME).isFile()) return false;
++        return libraryOf(dir) != null;
++    }
++
++    /**
++     * The library an install's own manifest points at, if it is still there.
++     *
++     * The manifest is the source of truth rather than a fixed file name: a pack may ship
++     * `libvulkan_lvp.so` or any other name it declared, and only the manifest knows which.
++     */
++    static File libraryOf(File dir) {
++        try {
++            JSONObject body = new JSONObject(FileUtils.readString(new File(dir, ICD_NAME))).optJSONObject("ICD");
++            String path = body != null ? body.optString("library_path", "") : "";
++            if (!path.isEmpty()) {
++                File lib = new File(path);
++                if (!lib.isAbsolute()) lib = new File(dir, path);
++                if (lib.isFile()) return lib;
++            }
++        } catch (Exception ignored) {
++            // Fall through to the historical name below.
++        }
++        // Installs made before packs could name their entry point keep the fixed name.
++        File legacy = new File(dir, LIB_NAME);
++        return legacy.isFile() ? legacy : null;
+     }
+ 
+     public String getIcdPath(String id) {
+@@ -97,8 +123,11 @@ public class LinuxVulkanDriverManager {
+         File tmpDir = newStagingDir();
+         boolean keep = false;
+         try {
+-            String soName = null;
+             JSONObject zipMeta = null;
++            // Every shared object in the pack is kept, not just the entry point. A GPU driver pack is
++            // one file (Turnip), but a CPU renderer is not: lavapipe needs its LLVM and its X/Wayland
++            // shims beside it, and the loader has to find them in the same directory.
++            Map<String, File> libs = new LinkedHashMap<>();
+             try (InputStream is = context.getContentResolver().openInputStream(zipUri);
+                  ZipInputStream zis = new ZipInputStream(is)) {
+                 if (is == null) throw new IOException("cannot open " + zipUri);
+@@ -107,22 +136,29 @@ public class LinuxVulkanDriverManager {
+                     if (entry.isDirectory()) continue;
+                     String base = new File(entry.getName()).getName();
+                     if (base.isEmpty()) continue;
+-                    if (base.startsWith("libvulkan_freedreno") && base.endsWith(".so")) {
+-                        if (soName != null) Log.w(TAG, "zip has several libvulkan_freedreno*.so; using the first (" + soName + ")");
+-                        else {
+-                            Files.copy(zis, new File(tmpDir, LIB_NAME).toPath(), StandardCopyOption.REPLACE_EXISTING);
+-                            soName = base;
+-                        }
+-                    } else if (base.equals(META_NAME)) {
++                    if (base.equals(META_NAME)) {
+                         try {
+                             zipMeta = new JSONObject(new String(readAll(zis), StandardCharsets.UTF_8));
+                         } catch (Exception e) {
+                             Log.w(TAG, "meta.json unreadable, ignoring: " + e.getMessage());
+                         }
++                    } else if (base.endsWith(".so") || base.contains(".so.")) {
++                        File dst = new File(tmpDir, base);
++                        Files.copy(zis, dst.toPath(), StandardCopyOption.REPLACE_EXISTING);
++                        libs.put(base, dst);
+                     }
+                 }
+             }
+-            String id = adopt(tmpDir, soName, zipMeta, displayName);
++            String declared = zipMeta != null ? zipMeta.optString("library", "") : "";
++            String entryName = pickEntry(libs, declared);
++            File entryFile = entryName == null ? null : libs.get(entryName);
++            // Packs that do not name their entry point keep the historical file name, so an existing
++            // Turnip install and a fresh one are laid out the same way.
++            if (entryFile != null && declared.isEmpty() && !entryName.equals(LIB_NAME)) {
++                File renamed = new File(tmpDir, LIB_NAME);
++                if (entryFile.renameTo(renamed)) entryFile = renamed;
++            }
++            String id = adopt(tmpDir, entryFile, entryName, zipMeta, displayName);
+             keep = true;
+             return id;
+         } finally {
+@@ -137,12 +173,11 @@ public class LinuxVulkanDriverManager {
+         return tmpDir;
+     }
+ 
+-    String adopt(File tmpDir, String soName, JSONObject zipMeta, String displayName) throws IOException {
++    String adopt(File tmpDir, File so, String soName, JSONObject zipMeta, String displayName) throws IOException {
+         try {
+-            if (soName == null) {
++            if (so == null || !so.isFile()) {
+                 throw new IllegalArgumentException(context.getString(R.string.lvd_no_library));
+             }
+-            File so = new File(tmpDir, LIB_NAME);
+             if (!isAarch64Elf(so)) {
+                 throw new IllegalArgumentException(context.getString(R.string.lvd_not_aarch64, soName));
+             }
+@@ -167,8 +202,8 @@ public class LinuxVulkanDriverManager {
+             JSONObject icd = new JSONObject();
+             icd.put("file_format_version", "1.0.0");
+             JSONObject icdBody = new JSONObject();
+-            icdBody.put("library_path", new File(dir, LIB_NAME).getAbsolutePath());
+-            icdBody.put("api_version", "1.1.274");
++            icdBody.put("library_path", new File(dir, so.getName()).getAbsolutePath());
++            icdBody.put("api_version", apiVersion(zipMeta != null ? zipMeta.optString("apiVersion", "") : ""));
+             icd.put("ICD", icdBody);
+             if (!FileUtils.writeString(new File(tmpDir, ICD_NAME), icd.toString(2))) throw new IOException("cannot write icd.json");
+ 
+@@ -198,6 +233,35 @@ public class LinuxVulkanDriverManager {
+         return id;
+     }
+ 
++    /**
++     * Which library in the pack the loader should open.
++     *
++     * A pack may name it in meta.json; otherwise the historical Turnip name is used, and failing
++     * that any Vulkan driver in the pack - so a CPU renderer can be imported without a meta.json.
++     */
++    /**
++     * The Vulkan version to declare in the generated manifest.
++     *
++     * This used to be the constant 1.1.274, which was true of every Turnip pack and is not true of
++     * a CPU renderer: a Mesa 26 lavapipe is a 1.4 driver, and a manifest that says 1.1 makes the
++     * loader treat it as one, so a compositor that needs 1.3 reports "no physical device" even
++     * though the driver is loaded and enumerable. The pack states its own version; the old constant
++     * stays as the default so packs published before this field still import unchanged.
++     */
++    static String apiVersion(String declared) {
++        String value = declared == null ? "" : declared.trim();
++        return value.matches("\\d+\\.\\d+\\.\\d+") ? value : DEFAULT_API_VERSION;
++    }
++
++    static final String DEFAULT_API_VERSION = "1.1.274";
++
++    static String pickEntry(Map<String, File> libs, String declared) {
++        if (!declared.isEmpty()) return libs.containsKey(declared) ? declared : null;
++        for (String name : libs.keySet()) if (name.startsWith("libvulkan_freedreno")) return name;
++        for (String name : libs.keySet()) if (name.startsWith("libvulkan_")) return name;
++        return null;
++    }
++
+     static String sanitizeId(String name) {
+         String s = name.trim().replaceAll("[^A-Za-z0-9._-]+", "_").replaceAll("^[._]+", "");
+         if (s.length() > 64) s = s.substring(0, 64);
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/AndroidProbeEnv.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/AndroidProbeEnv.kt
+new file mode 100644
+index 0000000..0f29218
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/AndroidProbeEnv.kt
+@@ -0,0 +1,70 @@
++package com.droiddeck.launcher.gpu.probe
++
++import android.content.Context
++import android.os.Build
++import com.droiddeck.launcher.core.FileUtils
++import com.droiddeck.launcher.gpu.GpuInfo
++import com.droiddeck.launcher.gpu.VulkanInfo
++import com.droiddeck.launcher.session.SessionPrefs
++import java.io.File
++
++/** The real device, read the way the rest of the app already reads it. */
++object AndroidProbeEnv : ProbeEnv {
++    override fun exists(path: String): Boolean = File(path).exists()
++
++    override fun readText(path: String): String? = FileUtils.readString(File(path))
++
++    override fun property(name: String): String = GpuInfo.systemProperty(name)
++
++    override fun list(dir: String): List<String> = File(dir).list()?.toList().orEmpty()
++
++    override val sdkInt: Int get() = Build.VERSION.SDK_INT
++
++    override val hardware: String get() = Build.HARDWARE
++
++    override val manufacturer: String get() = Build.MANUFACTURER
++
++    override val vulkanDeviceName: String? get() = VulkanInfo.cachedOrNull()?.get("device")
++}
++
++/**
++ * The one place the app asks "what GPU is this, and what should draw with it".
++ *
++ * Callers should not reach for [GpuProbe] or [BackendRegistry] directly: the probe is cheap but not
++ * free (it stats a handful of vendor paths), and the decision has to be the same everywhere or the
++ * driver card and the session disagree about the device.
++ */
++object GpuBackends {
++
++    /** Probe without policy. Cheap enough to call from a settings screen; not from a draw loop. */
++    @JvmStatic
++    fun probe(): GpuProbeResult = GpuProbe.probe(AndroidProbeEnv)
++
++    /** The HarmonyOS build this device runs, for the card that explains the session's limits. */
++    @JvmStatic
++    fun harmonyOs(): HarmonyOs = HarmonyOs.detect(AndroidProbeEnv)
++
++    @JvmStatic
++    fun policy(context: Context): GpuPolicy = when (SessionPrefs.gpuBackend(context)) {
++        SessionPrefs.GPU_BACKEND_HARDWARE -> GpuPolicy.PREFER_HARDWARE
++        SessionPrefs.GPU_BACKEND_SOFTWARE -> GpuPolicy.FORCE_SOFTWARE
++        else -> GpuPolicy.AUTO
++    }
++
++    @JvmStatic
++    fun setPolicy(context: Context, policy: GpuPolicy) {
++        SessionPrefs.setGpuBackend(context, when (policy) {
++            GpuPolicy.AUTO -> SessionPrefs.GPU_BACKEND_AUTO
++            GpuPolicy.PREFER_HARDWARE -> SessionPrefs.GPU_BACKEND_HARDWARE
++            GpuPolicy.FORCE_SOFTWARE -> SessionPrefs.GPU_BACKEND_SOFTWARE
++        })
++    }
++
++    /** The backend this device uses under the user's setting. */
++    @JvmStatic
++    fun decide(context: Context): BackendDecision = decide(probe(), policy(context))
++
++    @JvmStatic
++    fun decide(probe: GpuProbeResult, policy: GpuPolicy): BackendDecision =
++        BackendRegistry.select(probe, policy)
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/BackendRegistry.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/BackendRegistry.kt
+new file mode 100644
+index 0000000..eb4179b
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/BackendRegistry.kt
+@@ -0,0 +1,90 @@
++package com.droiddeck.launcher.gpu.probe
++
++import com.droiddeck.launcher.gpu.probe.backends.LavapipeBackend
++import com.droiddeck.launcher.gpu.probe.backends.PanVkKbaseBackend
++import com.droiddeck.launcher.gpu.probe.backends.TurnipBackend
++import com.droiddeck.launcher.gpu.probe.backends.VendorBridgeBackend
++
++/**
++ * How much the user has asked for the GPU to be used.
++ *
++ * [AUTO] is what an install that never chose anything gets, and it is deliberately the conservative
++ * one: hardware only where the path is validated. Asking for the experimental Mali driver is a
++ * separate, explicit act, because the failure mode is not "a game runs badly" - it is a kernel hang.
++ */
++enum class GpuPolicy {
++    /** Only validated backends; anything else falls back to CPU rendering. */
++    AUTO,
++
++    /** Best available backend, including experimental ones, but never a blocked one. */
++    PREFER_HARDWARE,
++
++    /** CPU rendering whatever the device is. */
++    FORCE_SOFTWARE,
++}
++
++/** The chosen backend, plus every backend that had an opinion, for the device card and reports. */
++data class BackendDecision(
++    val chosen: BackendPlan,
++    val candidates: List<BackendPlan>,
++    val policy: GpuPolicy,
++) {
++    /** Whether the guest is kept away from the GPU entirely. */
++    val software: Boolean get() = !chosen.gpuInGuest
++}
++
++/**
++ * The ordered list of backends, and the one rule that picks between them.
++ *
++ * Order is the tie-break: when two backends carry the same risk, the earlier one wins, so the list
++ * reads as a preference order and the selection stays deterministic without a scoring scheme nobody
++ * can reason about.
++ */
++object BackendRegistry {
++
++    /** Preference order. Adreno first because it is the validated path. */
++    val backends: List<RenderBackend> = listOf(
++        TurnipBackend,
++        PanVkKbaseBackend,
++        LavapipeBackend,
++        VendorBridgeBackend,
++    )
++
++    fun evaluate(probe: GpuProbeResult, backends: List<RenderBackend> = this.backends): List<BackendPlan> =
++        backends.mapNotNull { it.evaluate(probe) }
++
++    /**
++     * The backend this device should use under [policy].
++     *
++     * A blocked plan is never chosen, even by [GpuPolicy.PREFER_HARDWARE]: blocked means it cannot
++     * work, not that it is untested. If nothing usable is left, CPU rendering is chosen - which is
++     * always available, and is the reason this function has no null case.
++     */
++    fun select(
++        probe: GpuProbeResult,
++        policy: GpuPolicy = GpuPolicy.AUTO,
++        backends: List<RenderBackend> = this.backends,
++    ): BackendDecision {
++        val candidates = evaluate(probe, backends)
++        val usable = candidates.filter { it.risk != Risk.BLOCKED }
++
++        val chosen = when (policy) {
++            GpuPolicy.FORCE_SOFTWARE -> usable.firstOrNull { it.driverRequirement == DriverRequirement.CPU_SOFTWARE }
++            GpuPolicy.AUTO -> usable.firstOrNull { it.risk == Risk.SAFE }
++            // Asking for hardware means hardware: a SAFE CPU renderer must not win this one, or the
++            // setting would do nothing on the only devices it exists for.
++            GpuPolicy.PREFER_HARDWARE -> usable
++                .filter { it.driverRequirement != DriverRequirement.CPU_SOFTWARE }
++                .minByOrNull { rank(it.risk) }
++        } ?: usable.firstOrNull { it.driverRequirement == DriverRequirement.CPU_SOFTWARE }
++            ?: LavapipeBackend.evaluate(probe)
++
++        return BackendDecision(chosen = chosen, candidates = candidates, policy = policy)
++    }
++
++    private fun rank(risk: Risk): Int = when (risk) {
++        Risk.SAFE -> 0
++        Risk.EXPERIMENTAL -> 1
++        Risk.BLOCKED -> 2
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/DeviceProfiles.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/DeviceProfiles.kt
+new file mode 100644
+index 0000000..a350c54
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/DeviceProfiles.kt
+@@ -0,0 +1,84 @@
++package com.droiddeck.launcher.gpu.probe
++
++/**
++ * Session settings a particular device needs, as opposed to the ones a person would pick.
++ *
++ * This exists because of one device class in particular: a Kirin 9010 has no Linux GPU driver, so
++ * every session on it is drawn by the CPU. On that path the defaults the app ships - full panel
++ * resolution, frame generation, FSR - are not "a bit heavy", they are the difference between a
++ * session that comes up and one that does not, and the user has no way to know which knob mattered.
++ *
++ * Null means "nothing device-specific": the app's own defaults are already right.
++ */
++data class SessionTuning(
++    /** Short name for the device card: "Kirin 9010 (software)". */
++    val label: String,
++    /** Render scale the session should start at, in percent of the panel. */
++    val resolutionScalePercent: Int,
++    /** Refresh rate to cap the session at, in Hz. */
++    val maxRefreshHz: Int,
++    /** Whether frame generation is worth offering at all. */
++    val frameGeneration: Boolean,
++    /** Whether the upscaler is worth offering at all. */
++    val upscaling: Boolean,
++    /** Guest environment this device needs on top of its backend's. */
++    val env: Map<String, String> = emptyMap(),
++    /** Why these numbers, in a sentence a bug report can quote. */
++    val notes: List<String> = emptyList(),
++)
++
++/**
++ * The per-device settings worth having an opinion about.
++ *
++ * Keyed by SoC rather than by phone model: the phones a SoC ships in differ in screen and RAM, but
++ * the reason the tuning is needed is the GPU, which they share.
++ */
++object DeviceProfiles {
++
++    /** SoCs whose only path today is CPU rendering: Maleoon 910 (9000S, 9010) and 920 (9020). */
++    private val MALEOON_SOCS = setOf("kirin9000s", "kirin9010", "kirin9020", "kirin9020a", "kirin9030")
++
++    fun forProbe(probe: GpuProbeResult, cpuCores: Int = 8): SessionTuning? {
++        val soc = probe.kirin?.id ?: return null
++        if (soc in MALEOON_SOCS) return maleoon(probe.kirin, cpuCores)
++        return null
++    }
++
++    /**
++     * Maleoon: software rendering, and tuned for it.
++     *
++     * The render scale is the one number that matters most - lavapipe's cost is close to linear in
++     * pixels, so 60% of a 1220p panel is roughly 2.8x less work per frame than 100%. Threads are
++     * capped below the core count because Android's own compositor and the Steam client need cores
++     * too, and starving them turns a slow session into a stuttering one.
++     */
++    private fun maleoon(soc: KirinSoc, cpuCores: Int): SessionTuning {
++        val threads = (cpuCores - 2).coerceIn(2, 6)
++        return SessionTuning(
++            label = "${soc.marketing} (software)",
++            resolutionScalePercent = 60,
++            maxRefreshHz = 60,
++            frameGeneration = false,
++            upscaling = false,
++            env = mapOf(
++                // lavapipe worker threads: leave the rest of the SoC for Android and Steam.
++                "LP_NUM_THREADS" to threads.toString(),
++                // Shader compilation is the main stall on a CPU renderer; keep it on disk.
++                "MESA_SHADER_CACHE_DIR" to "/var/cache/droiddeck/mesa",
++                "MESA_SHADER_CACHE_DISABLE" to "false",
++            ),
++            notes = listOf(
++                "${soc.marketing} carries ${soc.gpu}, which has no Linux driver: the session draws on the CPU.",
++                "Frame generation and the upscaler are off because both need a Vulkan device.",
++                "Expect the launcher and desktop to be usable and games to be slow; that is the renderer, not a setting.",
++                // Every Maleoon device is a Huawei one, and Huawei's killer is not AOSP's.
++                "HarmonyOS's low-memory killer is stricter than AOSP's: the container's processes need a " +
++                    "non-zero oom_score_adj, or one spike kills the whole session rather than one game.",
++                // Measured on a Kirin 9010 handset: 1260x2844, so a landscape session is 2844x1260 and
++                // 60% of that is 1706x756. The figure is a starting point, not a measurement of what
++                // the phone can hold; it is the first thing to raise if the session feels soft.
++                "60% of a 2844x1260 landscape panel is 1706x756; raise the scale only after measuring.",
++            ),
++        )
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/GpuProbe.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/GpuProbe.kt
+new file mode 100644
+index 0000000..44550bc
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/GpuProbe.kt
+@@ -0,0 +1,216 @@
++package com.droiddeck.launcher.gpu.probe
++
++/**
++ * What the probe concluded about this device's GPU, in the terms a backend is chosen by.
++ *
++ * Everything here is read-only fact plus one derived judgement ([vendor]); no policy lives in it.
++ * The rule that decides whether the GPU is handed to a guest belongs to [RenderBackend].
++ */
++data class GpuProbeResult(
++    val vendor: GpuVendor,
++    /** The GPU as this device names it: "Adreno 740", "Mali-G78 MP24", "Maleoon 910". */
++    val deviceName: String,
++    /** The three-digit Adreno model, or 0. Unchanged from the Adreno-only probe, for the driver lists. */
++    val adrenoModel: Int,
++    /** Which kbase generation the Mali kernel driver speaks, when there is one. */
++    val kbase: KbaseInterface,
++    /** The Kirin SoC this is, when the device is a Kirin at all. */
++    val kirin: KirinSoc?,
++    /** The kernel node the GPU is reached through, when one was found. */
++    val kernelNode: String?,
++    /** The vendor's Vulkan library, when one was found. */
++    val driverLib: String?,
++    val sdkInt: Int,
++) {
++    /** Whether this is the one path the app has actually been validated on. */
++    val isAdreno: Boolean get() = vendor == GpuVendor.QUALCOMM
++
++    /** A Mali-era Kirin (Kirin 9000 and older): licensed Mali, so a Mesa backend can exist. */
++    val isMaliKirin: Boolean get() = vendor == GpuVendor.ARM_MALI
++
++    /** A Maleoon-era Kirin (Kirin 9000S and newer): Huawei's own GPU, no Mesa backend exists. */
++    val isMaleoonKirin: Boolean get() = vendor == GpuVendor.HUAWEI_MALEOON
++
++    /** One line for the device card and the report. */
++    fun summary(): String = buildString {
++        append(deviceName)
++        kirin?.let { append(" · ").append(it.marketing).append(" (").append(it.era.label).append(')') }
++        if (kbase != KbaseInterface.NONE) append(" · ").append(kbase.label)
++    }
++}
++
++/**
++ * Reads a device and says what its GPU is.
++ *
++ * Detection is by evidence, never by brand: a Huawei phone whose GPU reports "Maleoon 910" is Maleoon
++ * whatever its SoC table says, and a phone with only `/dev/mali0` and no SoC match is still Mali. The
++ * order below is the priority order - Adreno first because it is the only vendor whose node and
++ * driver are unambiguous, then Huawei's own GPU, then ARM's.
++ *
++ * Driver libraries are **enumerated, not guessed**. A Kirin 9010 handset ships its Vulkan driver as
++ * `/vendor/lib64/hw/vulkan.hvgr_v200.so` - `hvgr`, not `maleoon`, and the device has no `/dev/mali0`
++ * and no `/dev/dri` at all. Hard-coding the name the marketing material suggests would have missed
++ * the device entirely, so [driverLibs] lists the HAL directory and classifies what it finds.
++ */
++object GpuProbe {
++
++    fun probe(env: ProbeEnv): GpuProbeResult {
++        val vulkanName = env.vulkanDeviceName.orEmpty()
++        val kirin = KirinCatalog.identify(
++            env.property("ro.board.platform"),
++            env.property("ro.soc.model"),
++            env.property("ro.hardware"),
++            env.hardware,
++            env.property("ro.vendor.product.device"),
++        )
++        val libs = driverLibs(env)
++        val maliNode = listOf(DriverPaths.MALI_DEV, DriverPaths.MALI_SYS).firstOrNull { env.exists(it) }
++
++        // 1. Adreno: kgsl's node, or Qualcomm's own Vulkan driver, is proof on its own.
++        if (env.exists(DriverPaths.KGSL) || libs.containsKey(GpuVendor.QUALCOMM)) {
++            val model = adrenoModel(env, vulkanName)
++            return GpuProbeResult(
++                vendor = GpuVendor.QUALCOMM,
++                deviceName = if (model > 0) "Adreno $model" else "Adreno",
++                adrenoModel = model,
++                kbase = KbaseInterface.NONE,
++                kirin = kirin,
++                kernelNode = DriverPaths.KGSL.takeIf { env.exists(it) },
++                driverLib = libs[GpuVendor.QUALCOMM],
++                sdkInt = env.sdkInt,
++            )
++        }
++
++        // 2. Maleoon: the GPU's own name, Huawei's driver, or a Maleoon-era Kirin with no Mali node.
++        val maleoonNamed = vulkanName.contains("maleoon", ignoreCase = true)
++        if (maleoonNamed || libs.containsKey(GpuVendor.HUAWEI_MALEOON) ||
++            (kirin?.era == KirinSoc.Era.MALEOON && maliNode == null)
++        ) {
++            return GpuProbeResult(
++                vendor = GpuVendor.HUAWEI_MALEOON,
++                deviceName = maleoonName(vulkanName) ?: kirin?.gpu ?: "Maleoon",
++                adrenoModel = 0,
++                kbase = KbaseInterface.NONE,
++                kirin = kirin,
++                kernelNode = null,
++                driverLib = libs[GpuVendor.HUAWEI_MALEOON],
++                sdkInt = env.sdkInt,
++            )
++        }
++
++        // 3. ARM Mali: a kbase node, or ARM's own driver libraries.
++        if (maliNode != null || libs.containsKey(GpuVendor.ARM_MALI)) {
++            return GpuProbeResult(
++                vendor = GpuVendor.ARM_MALI,
++                deviceName = maliName(vulkanName) ?: kirin?.gpu ?: "Mali",
++                adrenoModel = 0,
++                kbase = kbaseInterface(env, maliNode, kirin),
++                kirin = kirin,
++                kernelNode = maliNode,
++                driverLib = libs[GpuVendor.ARM_MALI],
++                sdkInt = env.sdkInt,
++            )
++        }
++
++        // 4. Named-but-unsupported vendors, so the card can say why rather than "unknown".
++        val named = when {
++            libs.containsKey(GpuVendor.SAMSUNG_XCLIPSE) || vulkanName.contains("xclipse", true) ->
++                GpuVendor.SAMSUNG_XCLIPSE
++            libs.containsKey(GpuVendor.IMAGINATION) || vulkanName.contains("powervr", true) ->
++                GpuVendor.IMAGINATION
++            else -> GpuVendor.UNKNOWN
++        }
++        return GpuProbeResult(
++            vendor = named,
++            deviceName = vulkanName.ifBlank { env.hardware.ifBlank { "this GPU" } },
++            adrenoModel = 0,
++            kbase = KbaseInterface.NONE,
++            kirin = kirin,
++            kernelNode = null,
++            driverLib = libs[named],
++            sdkInt = env.sdkInt,
++        )
++    }
++
++    /**
++     * Every vendor Vulkan driver installed, by vendor.
++     *
++     * Known paths first, because they are cheap; then the HAL directory is listed so a vendor that
++     * names its driver something unexpected is still found. First match per vendor wins.
++     */
++    internal fun driverLibs(env: ProbeEnv): Map<GpuVendor, String> {
++        val out = LinkedHashMap<GpuVendor, String>()
++        val known = listOf(
++            DriverPaths.ADRENO_VULKAN to GpuVendor.QUALCOMM,
++            DriverPaths.MALEOON_VULKAN to GpuVendor.HUAWEI_MALEOON,
++            DriverPaths.HVGR_VULKAN to GpuVendor.HUAWEI_MALEOON,
++            DriverPaths.MALI_VULKAN to GpuVendor.ARM_MALI,
++            DriverPaths.MALI_VULKAN_ALT to GpuVendor.ARM_MALI,
++            DriverPaths.XCLIPSE_VULKAN to GpuVendor.SAMSUNG_XCLIPSE,
++            DriverPaths.POWERVR_VULKAN to GpuVendor.IMAGINATION,
++        )
++        for ((path, vendor) in known) if (env.exists(path)) out.putIfAbsent(vendor, path)
++        for (name in env.list(DriverPaths.HW_DIR)) {
++            val vendor = vendorOfDriverFile(name) ?: continue
++            out.putIfAbsent(vendor, "${DriverPaths.HW_DIR}/$name")
++        }
++        return out
++    }
++
++    /** Which vendor a HAL driver file belongs to, from its name alone. */
++    internal fun vendorOfDriverFile(name: String): GpuVendor? {
++        val n = name.lowercase()
++        if (!n.startsWith("vulkan") || !n.endsWith(".so")) return null
++        return when {
++            n.contains("adreno") -> GpuVendor.QUALCOMM
++            // Huawei ships its GPU driver as "hvgr" (GPU renderer); "maleoon" is the marketing name.
++            n.contains("hvgr") || n.contains("maleoon") -> GpuVendor.HUAWEI_MALEOON
++            n.contains("mali") -> GpuVendor.ARM_MALI
++            n.contains("xclipse") -> GpuVendor.SAMSUNG_XCLIPSE
++            n.contains("powervr") -> GpuVendor.IMAGINATION
++            else -> null
++        }
++    }
++
++    /**
++     * CSF or JM.
++     *
++     * kbase does not expose the generation in one portable file, so this reads what it can and
++     * falls back to what the SoC is known to be - and says "unknown" rather than guessing when both
++     * are silent, because a wrong answer here picks a driver that cannot work.
++     */
++    internal fun kbaseInterface(env: ProbeEnv, node: String?, kirin: KirinSoc?): KbaseInterface {
++        if (node == null) return KbaseInterface.NONE
++        for (path in listOf(DriverPaths.MALI_CSF, DriverPaths.MALI_CSF_ALT)) {
++            val text = env.readText(path)?.trim()
++            if (!text.isNullOrEmpty() && text != "0") return KbaseInterface.CSF
++        }
++        // A CSF kernel names its firmware node; JM kernels do not.
++        if (env.exists("/sys/class/misc/mali0/device/csf_fw_version")) return KbaseInterface.CSF
++        return kirin?.kbase?.takeIf { it != KbaseInterface.NONE } ?: KbaseInterface.UNKNOWN
++    }
++
++    internal fun adrenoModel(env: ProbeEnv, vulkanName: String): Int {
++        val fromKernel = threeDigits(env.readText("/sys/class/kgsl/kgsl-3d0/gpu_model").orEmpty())
++        if (fromKernel > 0) return fromKernel
++        val fromVulkan = threeDigits(vulkanName)
++        if (fromVulkan > 0) return fromVulkan
++        return 0
++    }
++
++    /** Same rule the Adreno probe has always used: "Adreno740v2", "Adreno (TM) 830". */
++    internal fun threeDigits(text: String): Int =
++        Regex("""(?i)\badreno\s*(?:\(TM\)\s*)?(\d{3})(?!\d)""").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
++
++    /** "Mali-G78" from a Vulkan name, when it carries one. */
++    internal fun maliName(vulkanName: String): String? =
++        Regex("""((?:Mali|Immortalis)-[GT]\d{2,4}(?:\s+MC\d+)?)""", RegexOption.IGNORE_CASE)
++            .find(vulkanName)?.groupValues?.get(1)
++
++    /** "Maleoon 910" from a Vulkan name, when it carries one. Spacing is normalised. */
++    internal fun maleoonName(vulkanName: String): String? {
++        val digits = Regex("""Maleoon\s*(\d{3})""", RegexOption.IGNORE_CASE)
++            .find(vulkanName)?.groupValues?.get(1) ?: return null
++        return "Maleoon $digits"
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/GpuVendor.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/GpuVendor.kt
+new file mode 100644
+index 0000000..5e2d94a
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/GpuVendor.kt
+@@ -0,0 +1,27 @@
++package com.droiddeck.launcher.gpu.probe
++
++/**
++ * Who makes the GPU, as the driver stack is what actually differs - not the marketing name.
++ *
++ * The split matters because each vendor has a different kernel interface, a different set of
++ * user-space drivers, and therefore a different answer to "can a Linux guest draw with it at all".
++ */
++enum class GpuVendor(val label: String) {
++    /** Qualcomm Adreno: kgsl kernel driver, Mesa Turnip in the runtime. The tested path. */
++    QUALCOMM("Qualcomm Adreno"),
++
++    /** ARM Mali: mali_kbase kernel driver, PanVK (or the vendor's own blob). */
++    ARM_MALI("ARM Mali"),
++
++    /** Huawei Maleoon (Kirin 9000S and newer): closed driver, no Mesa backend exists. */
++    HUAWEI_MALEOON("Huawei Maleoon"),
++
++    /** Samsung Xclipse (RDNA-based): no guest driver path here either. */
++    SAMSUNG_XCLIPSE("Samsung Xclipse"),
++
++    /** Imagination PowerVR. */
++    IMAGINATION("Imagination PowerVR"),
++
++    /** Something the probe could not name. Never guessed into a vendor. */
++    UNKNOWN("Unknown GPU"),
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/HarmonyOs.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/HarmonyOs.kt
+new file mode 100644
+index 0000000..045953e
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/HarmonyOs.kt
+@@ -0,0 +1,76 @@
++package com.droiddeck.launcher.gpu.probe
++
++/**
++ * HarmonyOS, as far as a Linux session on top of it is concerned.
++ *
++ * The distinction that matters is not the version number but whether the device still runs Android
++ * applications at all. HarmonyOS 4.x is built on Android 12 (API 31/32), so this app installs and its
++ * Android APIs work; HarmonyOS NEXT 5.x dropped that compatibility layer, and an APK cannot be
++ * installed there in the first place - which is why there is no runtime check for it, only a note in
++ * the support matrix.
++ *
++ * What *does* need handling at runtime is Huawei's process management: its low-memory killer is more
++ * aggressive than AOSP's, and a proot container whose processes all sit at `oom_score_adj=0` is a
++ * single spike away from being killed whole. That is a session concern, surfaced here so the device
++ * card can warn before a user loses a 40-minute install to it.
++ */
++data class HarmonyOs(
++    val detected: Boolean,
++    /** Best-effort version string, "4.2.0" style; "" when the build does not say. */
++    val version: String,
++    /** API level the Android compatibility layer reports. */
++    val apiLevel: Int,
++) {
++    /**
++     * Whether a Linux session can run here at all.
++     *
++     * True for HarmonyOS 4.x: it carries an Android 12 compatibility layer. A device below API 26 is
++     * refused by the app's own `minSdk` long before this, so this only guards against a build that
++     * reports a Huawei SoC with no Android layer under it.
++     */
++    val sessionCapable: Boolean get() = detected && apiLevel >= 26
++
++    /** One line for the device card, or "" when this is not a HarmonyOS device. */
++    fun label(): String = when {
++        !detected -> ""
++        version.isNotEmpty() -> "HarmonyOS $version (Android API $apiLevel)"
++        else -> "HarmonyOS (Android API $apiLevel)"
++    }
++
++    companion object {
++        fun detect(env: ProbeEnv): HarmonyOs {
++            val huawei = env.manufacturer.equals("HUAWEI", ignoreCase = true) ||
++                env.property("ro.board.platform").contains("kirin", ignoreCase = true) ||
++                env.property("ro.board.platform").startsWith("hi", ignoreCase = true)
++            if (!huawei) return HarmonyOs(detected = false, version = "", apiLevel = env.sdkInt)
++
++            // `hw_sc.build.platform.version` states the HarmonyOS version directly; older builds
++            // only carry the EMUI one, which is the same release numbered ten higher.
++            val direct = env.property("hw_sc.build.platform.version")
++                .ifBlank { env.property("ro.build.version.harmony") }
++            val version = if (direct.isNotBlank()) numbers(direct) else fromEmui(env.property("ro.build.version.emui"))
++            return HarmonyOs(
++                detected = true,
++                version = version,
++                apiLevel = env.sdkInt,
++            )
++        }
++
++        internal fun numbers(raw: String): String =
++            Regex("""\d+(?:\.\d+){1,3}""").find(raw)?.value.orEmpty()
++
++        /**
++         * "EmotionUI_14.0.0" is HarmonyOS 4.0.0; "EmotionUI_13.1.0" is 3.1.0.
++         *
++         * EMUI numbering ran ten ahead of the HarmonyOS numbering for the same release, so a build
++         * that only reports EMUI can still be described in the terms a user recognises.
++         */
++        internal fun fromEmui(raw: String): String {
++            if (raw.isBlank()) return ""
++            val match = Regex("""(\d+)((?:\.\d+){1,3})""").find(raw) ?: return ""
++            val major = match.groupValues[1].toIntOrNull() ?: return ""
++            val rest = match.groupValues[2]
++            return if (major < 10) "$major$rest" else "${major - 10}$rest"
++        }
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/KbaseInterface.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/KbaseInterface.kt
+new file mode 100644
+index 0000000..d04a924
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/KbaseInterface.kt
+@@ -0,0 +1,23 @@
++package com.droiddeck.launcher.gpu.probe
++
++/**
++ * How a Mali-family kernel driver is reached, which decides whether a given PanVK build can talk to
++ * it at all.
++ *
++ * This is the detail that makes "Mali support" a family of backends rather than one: a build made
++ * for CSF cannot drive a Job Manager (JM) GPU, and a Kirin 9000 (G78, JM) is not a Mali-G615
++ * (Valhall v10, CSF) however similar the marketing name looks.
++ */
++enum class KbaseInterface(val label: String) {
++    /** Command Stream Frontend - Mali-G710/G715/G615 and newer (Valhall v10+). */
++    CSF("kbase CSF"),
++
++    /** Job Manager - Mali-G78 and older (Bifrost and Valhall v7-v9). */
++    JM("kbase JM"),
++
++    /** No kbase node found; the driver is either absent or something else entirely. */
++    NONE("no kbase node"),
++
++    /** A node exists but the interface generation could not be read. */
++    UNKNOWN("kbase, interface unknown"),
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/KirinCatalog.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/KirinCatalog.kt
+new file mode 100644
+index 0000000..fd04d63
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/KirinCatalog.kt
+@@ -0,0 +1,107 @@
++package com.droiddeck.launcher.gpu.probe
++
++/**
++ * One Kirin SoC, described by what it means for a Linux guest rather than by its benchmark score.
++ *
++ * [era] is the load-bearing field. Kirin shipped two completely different GPU stacks under the same
++ * name: ARM's licensed Mali up to the 9000, then Huawei's own Maleoon from the 9000S on. A support
++ * matrix that treats "Kirin" as one thing is wrong for half the devices it names.
++ */
++data class KirinSoc(
++    /** Stable id used in reports and tests: "kirin9000", "kirin9000s". */
++    val id: String,
++    /** How a person says it: "Kirin 9000S". */
++    val marketing: String,
++    /** The GPU as the device reports it: "Mali-G78 MP24", "Maleoon 910". */
++    val gpu: String,
++    val vendor: GpuVendor,
++    val era: Era,
++    /** The kbase generation this GPU's kernel driver speaks, for Mali parts. */
++    val kbase: KbaseInterface,
++    /** Lowest Android API level the vendor shipped this SoC with. */
++    val minApi: Int,
++) {
++    enum class Era(val label: String) {
++        /** Bifrost: Mali-G71/G72. Valhall v7-v9: G76/G77/G78. ARM-licensed. */
++        MALI("ARM Mali (licensed)"),
++
++        /** Huawei's own GPU. No Mesa backend, no open driver, no guest path. */
++        MALEOON("Huawei Maleoon (in-house)"),
++    }
++
++    /** Whether any open-source Vulkan backend could ever drive this GPU from inside the guest. */
++    val hasOpenGuestDriver: Boolean get() = vendor == GpuVendor.ARM_MALI
++}
++
++/**
++ * The Kirin models a support decision can actually be made about.
++ *
++ * Only SoCs whose GPU is documented are listed; an unlisted Kirin is treated as unknown rather than
++ * guessed, because guessing a GPU generation is exactly how a wrong PanVK build gets shipped.
++ */
++object KirinCatalog {
++    private val M = GpuVendor.ARM_MALI
++    private val H = GpuVendor.HUAWEI_MALEOON
++    private val JM = KbaseInterface.JM
++    private val CSF = KbaseInterface.CSF
++
++    val entries: List<KirinSoc> = listOf(
++        KirinSoc("kirin960", "Kirin 960", "Mali-G71 MP8", M, KirinSoc.Era.MALI, JM, 24),
++        KirinSoc("kirin970", "Kirin 970", "Mali-G72 MP12", M, KirinSoc.Era.MALI, JM, 26),
++        KirinSoc("kirin980", "Kirin 980", "Mali-G76 MP10", M, KirinSoc.Era.MALI, JM, 28),
++        KirinSoc("kirin985", "Kirin 985", "Mali-G77 MP8", M, KirinSoc.Era.MALI, JM, 29),
++        KirinSoc("kirin990", "Kirin 990", "Mali-G76 MP16", M, KirinSoc.Era.MALI, JM, 29),
++        KirinSoc("kirin9000", "Kirin 9000", "Mali-G78 MP24", M, KirinSoc.Era.MALI, JM, 29),
++        KirinSoc("kirin9000e", "Kirin 9000E", "Mali-G78 MP22", M, KirinSoc.Era.MALI, JM, 30),
++        // The divide: everything below is Maleoon, and has no open guest driver at all.
++        KirinSoc("kirin9000s", "Kirin 9000S", "Maleoon 910", H, KirinSoc.Era.MALEOON, KbaseInterface.NONE, 31),
++        KirinSoc("kirin9010", "Kirin 9010", "Maleoon 910", H, KirinSoc.Era.MALEOON, KbaseInterface.NONE, 31),
++        KirinSoc("kirin9020", "Kirin 9020", "Maleoon 920", H, KirinSoc.Era.MALEOON, KbaseInterface.NONE, 31),
++        KirinSoc("kirin9020a", "Kirin 9020A", "Maleoon 920", H, KirinSoc.Era.MALEOON, KbaseInterface.NONE, 31),
++        KirinSoc("kirin9030", "Kirin 9030", "Maleoon 9xx", H, KirinSoc.Era.MALEOON, KbaseInterface.NONE, 31),
++        // Mid-range parts people actually play on.
++        KirinSoc("kirin810", "Kirin 810", "Mali-G52 MP6", M, KirinSoc.Era.MALI, JM, 28),
++        KirinSoc("kirin820", "Kirin 820", "Mali-G57 MP6", M, KirinSoc.Era.MALI, JM, 29),
++    )
++
++    private val byId: Map<String, KirinSoc> = entries.associateBy { it.id }
++
++    fun byId(id: String): KirinSoc? = byId[id.trim().lowercase()]
++
++    /**
++     * The Kirin a device is, from whatever strings it chose to expose.
++     *
++     * Huawei is not consistent here: `ro.board.platform` carries "kirin9000" on some builds,
++     * "hi3660" on older ones, and a marketing string on others, so every source is tried and the
++     * longest matching token wins - "kirin9000s" must not be read as "kirin9000".
++     */
++    fun identify(vararg candidates: String?): KirinSoc? {
++        val tokens = candidates.filterNotNull()
++            .flatMap { split(it) }
++        if (tokens.isEmpty()) return null
++        // Longest first so a more specific id beats its own prefix.
++        for (token in tokens.sortedByDescending { it.length }) {
++            byId[token]?.let { return it }
++        }
++        return null
++    }
++
++    private val LEGACY = mapOf(
++        "hi3660" to "kirin960", "hi3670" to "kirin970", "hi3680" to "kirin980",
++        "hi3690" to "kirin990", "hi6250" to "kirin659", "hi6210" to "kirin650",
++    )
++
++    /** Every "kirin####" / "hi####" token in a string, normalised. */
++    internal fun split(raw: String): List<String> {
++        val lower = raw.lowercase()
++        val out = mutableListOf<String>()
++        Regex("""kirin\s*-?\s*(\d{3,4}[a-z]?)(?!\d)""").findAll(lower).forEach {
++            out += "kirin" + it.groupValues[1]
++        }
++        Regex("""\b(hi\d{4})\b""").findAll(lower).forEach { m ->
++            out += m.groupValues[1]
++            LEGACY[m.groupValues[1]]?.let { out += it }
++        }
++        return out
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/ProbeEnv.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/ProbeEnv.kt
+new file mode 100644
+index 0000000..1d09a9a
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/ProbeEnv.kt
+@@ -0,0 +1,66 @@
++package com.droiddeck.launcher.gpu.probe
++
++/**
++ * Everything the probe is allowed to look at, behind one interface.
++ *
++ * The point is not abstraction for its own sake: it is that a Kirin phone cannot be plugged into a
++ * build machine, so the only way a detection rule can be tested at all is to hand it a described
++ * device instead of a real one. [AndroidProbeEnv] reads the phone; tests read a map.
++ */
++interface ProbeEnv {
++    fun exists(path: String): Boolean
++
++    /** The file's text, or null when it is missing or unreadable. */
++    fun readText(path: String): String?
++
++    /** A system property, or "" when it is unset. */
++    fun property(name: String): String
++
++    /** File names directly inside [dir], or empty when it cannot be listed. */
++    fun list(dir: String): List<String>
++
++    /** Build.VERSION.SDK_INT. */
++    val sdkInt: Int
++
++    /** Build.HARDWARE. */
++    val hardware: String
++
++    /** Build.MANUFACTURER. */
++    val manufacturer: String
++
++    /** The Vulkan device name, when it has already been queried; null otherwise. */
++    val vulkanDeviceName: String?
++}
++
++/** The Vulkan driver libraries an Android device can carry, by vendor. */
++internal object DriverPaths {
++    /** Where Android's Vulkan HAL drivers live. Enumerated, not guessed - see [GpuProbe]. */
++    const val HW_DIR = "/vendor/lib64/hw"
++
++    const val ADRENO_VULKAN = "/vendor/lib64/hw/vulkan.adreno.so"
++    const val MALI_VULKAN = "/vendor/lib64/hw/vulkan.mali.so"
++    const val MALI_VULKAN_ALT = "/vendor/lib64/hw/vulkan.arm.mali.so"
++    const val MALI_EGL = "/vendor/lib64/egl/libGLES_mali.so"
++    const val MALEOON_VULKAN = "/vendor/lib64/hw/vulkan.maleoon.so"
++    const val MALEOON_EGL = "/vendor/lib64/egl/libGLES_maleoon.so"
++
++    /**
++     * Huawei's own Vulkan driver, which is what a Kirin 9010 actually ships.
++     *
++     * The name is `hvgr` ("Huawei GPU renderer") and not `maleoon`, which is the GPU's marketing
++     * name - a distinction only real hardware makes clear. Recorded from a Kirin 9010 handset:
++     * `/vendor/lib64/hw/vulkan.hvgr_v200.so`, with no `/dev/mali0` and no `/dev/dri` on the device.
++     */
++    const val HVGR_VULKAN = "/vendor/lib64/hw/vulkan.hvgr_v200.so"
++
++    const val XCLIPSE_VULKAN = "/vendor/lib64/hw/vulkan.xclipse.so"
++    const val POWERVR_VULKAN = "/vendor/lib64/hw/vulkan.powerVR.so"
++
++    const val KGSL = "/sys/class/kgsl/kgsl-3d0"
++    const val MALI_DEV = "/dev/mali0"
++    const val MALI_SYS = "/sys/class/misc/mali0"
++
++    /** Written by mali_kbase: "1" or a version string on CSF kernels. */
++    const val MALI_CSF = "/sys/class/misc/mali0/device/csf_version"
++    const val MALI_CSF_ALT = "/sys/class/misc/mali0/csf_version"
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/RenderBackend.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/RenderBackend.kt
+new file mode 100644
+index 0000000..d40046b
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/RenderBackend.kt
+@@ -0,0 +1,56 @@
++package com.droiddeck.launcher.gpu.probe
++
++/**
++ * How much is known about a backend actually working, as opposed to how likely it looks.
++ *
++ * [SAFE] is reserved for paths that have been validated on hardware this project ships support for.
++ * [BLOCKED] is not "we have not tried it": it means the path cannot work at all on this device, and
++ * offering it would only produce a black screen with nothing in it to read.
++ */
++enum class Risk { SAFE, EXPERIMENTAL, BLOCKED }
++
++/** What a backend needs installed before it can draw anything. */
++enum class DriverRequirement {
++    /** The driver built into the Linux runtime. Adreno's Turnip. */
++    RUNTIME_DEFAULT,
++
++    /** A driver the user has to import explicitly, because shipping it is not defensible. */
++    IMPORTED_ICD,
++
++    /** A CPU renderer, so no GPU driver is involved at all. */
++    CPU_SOFTWARE,
++
++    /** Nothing can draw. The backend exists only to explain why. */
++    NONE_AVAILABLE,
++}
++
++/**
++ * A backend's answer for one device: what it would do, and what it costs.
++ *
++ * This is data, not behaviour, so the choice between backends can be asserted in a unit test on a
++ * machine with no phone attached - which is the whole reason the layer exists.
++ */
++data class BackendPlan(
++    val backendId: String,
++    val displayName: String,
++    val risk: Risk,
++    /** Whether the guest is handed the GPU's kernel node at all. */
++    val gpuInGuest: Boolean,
++    val driverRequirement: DriverRequirement,
++    /** Guest environment this backend adds. The ICD path is not here: the caller composes it. */
++    val env: Map<String, String> = emptyMap(),
++    /** DXVK settings this backend needs, as `dxvk.conf` keys. */
++    val dxvk: Map<String, String> = emptyMap(),
++    /** Host-to-guest binds, in `src:dst` form. */
++    val binds: List<String> = emptyList(),
++    /** Why this is the answer, in one sentence a bug report can quote. */
++    val reason: String,
++)
++
++/** One way of drawing a Linux session on an Android GPU. */
++interface RenderBackend {
++    val id: String
++
++    /** What this backend can do on [probe], or null when the device is not its business. */
++    fun evaluate(probe: GpuProbeResult): BackendPlan?
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/SessionGpu.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/SessionGpu.kt
+new file mode 100644
+index 0000000..257086d
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/SessionGpu.kt
+@@ -0,0 +1,185 @@
++package com.droiddeck.launcher.gpu.probe
++
++import android.content.Context
++import android.util.Log
++import com.droiddeck.launcher.core.CpuCores
++import com.droiddeck.launcher.gpu.LinuxVulkanDriverManager
++import com.droiddeck.launcher.session.SessionPrefs
++
++/**
++ * What the session needs from the backend decision, in the terms the guest understands.
++ *
++ * The point of this type is that the session should not have to reason about GPUs. It asks one
++ * question - "what do I put in the guest's environment, and at what size" - and gets an answer that
++ * is already specific to this device.
++ *
++ * [keepAdrenoDefaults] is the load-bearing field: when it is true the session writes exactly the
++ * environment it has always written, character for character. Nothing about the Adreno path may
++ * change because other vendors were added beside it.
++ */
++data class SessionGpuPlan(
++    val backendId: String,
++    val risk: Risk,
++    /** The guest draws on the CPU: no GPU node, no vendor driver, a software Vulkan ICD. */
++    val software: Boolean,
++    /** True when the session should write its own long-standing Adreno environment unchanged. */
++    val keepAdrenoDefaults: Boolean,
++    /** Vulkan ICD manifest for the guest, or null to keep the runtime's own. */
++    val icdPath: String?,
++    /**
++     * Directory holding the driver and the libraries it links against.
++     *
++     * A CPU renderer is not one file: lavapipe needs its LLVM and its X/Wayland shims beside it, and
++     * the dynamic loader only looks in default paths. The session puts this directory on the guest's
++     * `LD_LIBRARY_PATH` so those are found.
++     */
++    val libraryDir: String?,
++    /** A software session was asked for but no CPU Vulkan driver has been imported. */
++    val missingSoftwareDriver: Boolean,
++    /** Guest environment this plan adds. Empty when [keepAdrenoDefaults] is set. */
++    val env: Map<String, String>,
++    /** Render scale for the session output, in percent of the chosen size. 100 leaves it alone. */
++    val resolutionScalePercent: Int,
++    /** Refresh rate to cap the session at. 0 leaves it alone. */
++    val maxRefreshHz: Int,
++    val reason: String,
++)
++
++/**
++ * Turns a [BackendDecision] into a [SessionGpuPlan].
++ *
++ * Everything except [plan] itself is pure, so the mapping can be asserted on a build machine. The
++ * Android-facing part only looks up two things: which driver packs are installed, and how many cores
++ * the device has.
++ */
++object SessionGpu {
++    private const val TAG = "SessionGpu"
++
++    /** Backend ids whose environment the session already writes itself. */
++    private const val ADRENO_BACKEND = "turnip"
++
++    /**
++     * Whether a driver pack is a CPU renderer, by whatever name its author gave it.
++     *
++     * These are matched as whole words: "lvp" inside another word is not evidence of anything.
++     */
++    fun isSoftwareDriverName(text: String?): Boolean {
++        if (text.isNullOrBlank()) return false
++        val lower = text.lowercase()
++        if (lower.contains("lavapipe") || lower.contains("llvmpipe") ||
++            lower.contains("swrast") || lower.contains("softpipe")
++        ) return true
++        return lower.split(Regex("[^a-z0-9]+")).any { it == "lvp" }
++    }
++
++    /** The first imported driver pack that is a CPU renderer, or null. */
++    fun softwareDriverId(context: Context): String? {
++        val manager = LinuxVulkanDriverManager(context)
++        return pickSoftwareDriver(
++            installed = manager.enumerateInstalledDrivers(),
++            chosen = SessionPrefs.linuxDriver(context),
++            nameOf = manager::getDriverName,
++        )
++    }
++
++    /**
++     * Which CPU renderer to use when more than one is installed.
++     *
++     * The driver picked on the Components screen wins. Picking one there and then having the
++     * session quietly use a different one is the sort of thing that makes people stop trusting the
++     * screen - and it is what happened the first time two lavapipe packs were installed side by
++     * side, because the old code simply took the first id in alphabetical order.
++     */
++    fun pickSoftwareDriver(installed: List<String>, chosen: String, nameOf: (String) -> String): String? {
++        fun isSoftware(id: String) = isSoftwareDriverName(id) || isSoftwareDriverName(nameOf(id))
++        if (chosen.isNotEmpty() && chosen in installed && isSoftware(chosen)) return chosen
++        return installed.firstOrNull { isSoftware(it) }
++    }
++
++    /**
++     * The session's output size after the device profile's render scale.
++     *
++     * Rounded to an even number because a half-pixel edge shows up as a seam once the compositor
++     * scales the frame back to the panel, and floored at 320 so a small profile cannot produce a
++     * size gamescope refuses.
++     */
++    fun scaledOutput(value: Int, percent: Int): Int =
++        if (percent >= 100) value
++        else ((value.toLong() * percent / 100).toInt() / 2 * 2).coerceAtLeast(320)
++
++    /** The plan for this device under the user's current setting. */
++    fun plan(context: Context): SessionGpuPlan {
++        val probe = GpuBackends.probe()
++        val decision = BackendRegistry.select(probe, GpuBackends.policy(context))
++        val tuning = DeviceProfiles.forProbe(probe, CpuCores.all.size)
++        val softwareIcd = if (decision.software) softwareDriverId(context)?.let {
++            LinuxVulkanDriverManager(context).getIcdPath(it)
++        } else {
++            null
++        }
++        return plan(decision, softwareIcd, tuning)
++    }
++
++    fun plan(
++        decision: BackendDecision,
++        softwareIcd: String?,
++        tuning: SessionTuning?,
++    ): SessionGpuPlan {
++        val chosen = decision.chosen
++        if (!decision.software) {
++            // A GPU session: Adreno keeps its own environment, and a Mali one brings its own.
++            val adreno = chosen.backendId == ADRENO_BACKEND
++            return SessionGpuPlan(
++                backendId = chosen.backendId,
++                risk = chosen.risk,
++                software = false,
++                keepAdrenoDefaults = adreno,
++                icdPath = null,
++                libraryDir = null,
++                missingSoftwareDriver = false,
++                env = if (adreno) emptyMap() else chosen.env,
++                resolutionScalePercent = 100,
++                maxRefreshHz = 0,
++                reason = chosen.reason,
++            )
++        }
++        // A CPU session: the backend's own environment, plus whatever the device profile adds.
++        val env = LinkedHashMap<String, String>()
++        env.putAll(chosen.env)
++        tuning?.env?.let { env.putAll(it) }
++        return SessionGpuPlan(
++            backendId = chosen.backendId,
++            risk = chosen.risk,
++            software = true,
++            keepAdrenoDefaults = false,
++            icdPath = softwareIcd,
++            libraryDir = softwareIcd?.substringBeforeLast('/', "")?.ifEmpty { null },
++            missingSoftwareDriver = softwareIcd == null,
++            env = env,
++            resolutionScalePercent = tuning?.resolutionScalePercent?.coerceIn(10, 100) ?: 100,
++            maxRefreshHz = tuning?.maxRefreshHz ?: 0,
++            reason = chosen.reason,
++        )
++    }
++
++    /** One line for the session log, so a bug report says which path drew the frame. */
++    fun describe(plan: SessionGpuPlan): String = buildString {
++        append("gpu: ").append(plan.backendId).append(" [").append(plan.risk.name).append(']')
++        if (plan.software) {
++            append(" · software")
++            append(if (plan.icdPath != null) " (icd ${plan.icdPath})" else " (no CPU Vulkan driver imported)")
++            if (plan.resolutionScalePercent != 100) append(" · ${plan.resolutionScalePercent}%")
++            if (plan.maxRefreshHz > 0) append(" · ${plan.maxRefreshHz} Hz cap")
++        } else {
++            append(" · gpu in guest")
++        }
++    }
++
++    fun log(plan: SessionGpuPlan) {
++        if (plan.software && plan.missingSoftwareDriver) {
++            Log.e(TAG, "software session but no CPU Vulkan driver is imported: the guest will have no " +
++                "Vulkan device. Import a lavapipe pack under Components > GPU drivers.")
++        }
++        Log.i(TAG, describe(plan))
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/backends/LavapipeBackend.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/backends/LavapipeBackend.kt
+new file mode 100644
+index 0000000..c63cecb
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/backends/LavapipeBackend.kt
+@@ -0,0 +1,36 @@
++package com.droiddeck.launcher.gpu.probe.backends
++
++import com.droiddeck.launcher.gpu.probe.BackendPlan
++import com.droiddeck.launcher.gpu.probe.DriverRequirement
++import com.droiddeck.launcher.gpu.probe.GpuProbeResult
++import com.droiddeck.launcher.gpu.probe.RenderBackend
++import com.droiddeck.launcher.gpu.probe.Risk
++
++/**
++ * lavapipe: Vulkan on the CPU, with no GPU driver and no GPU device node in the guest.
++ *
++ * It is slow, and it is the reason a Kirin device can run at all instead of showing sound over a
++ * black screen. Everything that matters here is what it does *not* do: the guest is given no
++ * `/dev/mali0`, no `/dev/kgsl-3d0` and no `/dev/dri`, so no session - not gamescope, not Proton, not
++ * a probe - can reach a driver that might hang the kernel.
++ */
++object LavapipeBackend : RenderBackend {
++    const val ID = "lavapipe"
++
++    override val id = ID
++
++    override fun evaluate(probe: GpuProbeResult): BackendPlan = BackendPlan(
++        backendId = ID,
++        displayName = "lavapipe (CPU)",
++        risk = Risk.SAFE,
++        gpuInGuest = false,
++        driverRequirement = DriverRequirement.CPU_SOFTWARE,
++        env = mapOf(
++            "LIBGL_ALWAYS_SOFTWARE" to "1",
++            // Keeps a Mesa GL path from quietly reaching for the vendor driver behind our back.
++            "MESA_LOADER_DRIVER_OVERRIDE" to "llvmpipe",
++            "GALLIUM_DRIVER" to "llvmpipe",
++        ),
++        reason = "CPU Vulkan: no GPU node in the guest, so the session cannot touch the vendor driver.",
++    )
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/backends/PanVkKbaseBackend.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/backends/PanVkKbaseBackend.kt
+new file mode 100644
+index 0000000..c88cfec
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/backends/PanVkKbaseBackend.kt
+@@ -0,0 +1,80 @@
++package com.droiddeck.launcher.gpu.probe.backends
++
++import com.droiddeck.launcher.gpu.probe.BackendPlan
++import com.droiddeck.launcher.gpu.probe.DriverRequirement
++import com.droiddeck.launcher.gpu.probe.GpuProbeResult
++import com.droiddeck.launcher.gpu.probe.KbaseInterface
++import com.droiddeck.launcher.gpu.probe.RenderBackend
++import com.droiddeck.launcher.gpu.probe.Risk
++
++/**
++ * PanVK driving `mali_kbase` directly, for ARM Mali - which is what a Kirin 9000 and older is.
++ *
++ * Two things about this backend are deliberate and worth stating plainly:
++ *
++ *  1. **The GPU is bound as `/dev/mali0`, not disguised as a DRM render node.** PanVK opens the
++ *     kbase node itself; handing it over as `/dev/dri/renderD*` only invites other software to
++ *     issue DRM ioctls at a driver that never implemented them.
++ *  2. **CSF and JM are not the same backend.** A build made for CSF (Mali-G615, G715, G710) cannot
++ *     drive a Job Manager GPU (Mali-G78 in the Kirin 9000, G76 in the 980/990). Treating them as one
++ *     is how a device gets a driver that cannot work.
++ *
++ * No PanVK build is shipped: the user imports one, because an unauditable 21 MB blob that can hang a
++ * kernel is not something this project should hand out by default.
++ */
++object PanVkKbaseBackend : RenderBackend {
++    const val ID = "panvk-kbase"
++
++    override val id = ID
++
++    override fun evaluate(probe: GpuProbeResult): BackendPlan? {
++        if (probe.vendor != com.droiddeck.launcher.gpu.probe.GpuVendor.ARM_MALI) return null
++        return when (probe.kbase) {
++            KbaseInterface.CSF -> plan(
++                probe = probe,
++                risk = Risk.EXPERIMENTAL,
++                reason = "Mali ${probe.deviceName} on kbase CSF: an imported PanVK-kbase build can drive it; " +
++                    "frame pacing and stability are unverified on this device.",
++            )
++
++            KbaseInterface.JM, KbaseInterface.UNKNOWN -> BackendPlan(
++                backendId = ID,
++                displayName = "PanVK-kbase (JM)",
++                risk = Risk.BLOCKED,
++                gpuInGuest = false,
++                driverRequirement = DriverRequirement.NONE_AVAILABLE,
++                reason = "Mali ${probe.deviceName} on kbase ${probe.kbase.label}: the public PanVK-kbase " +
++                    "builds are CSF-only, so a Job Manager GPU has no reproducible driver. " +
++                    "Software rendering is the only path until a JM build is produced in CI.",
++            )
++
++            KbaseInterface.NONE -> null
++        }
++    }
++
++    private fun plan(probe: GpuProbeResult, risk: Risk, reason: String) = BackendPlan(
++        backendId = ID,
++        displayName = "PanVK-kbase (${probe.deviceName})",
++        risk = risk,
++        gpuInGuest = true,
++        driverRequirement = DriverRequirement.IMPORTED_ICD,
++        env = mapOf(
++            // gamescope and the session scripts read this to pick Mali-shaped defaults.
++            "BL_GPU_FAMILY" to "mali",
++            // PanVK-kbase builds cache compiled shaders on disk; without a stable dir Steam
++            // recompiles its whole shader set on every launch.
++            "MESA_SHADER_CACHE_DIR" to "/var/cache/droiddeck/mesa",
++            // Unified memory: PanVK reports most of system RAM as DEVICE_LOCAL, which makes DXVK
++            // allocate in 256 MiB chunks and die with VK_ERROR_OUT_OF_DEVICE_MEMORY. The kbase
++            // builds that understand this knob cap the reported heap instead.
++            "PANVK_HEAP_MEMORY_PERCENT" to "0.12",
++        ),
++        dxvk = mapOf(
++            "dxvk.maxMemoryBudget" to "384",
++            "dxvk.enableMemoryDefrag" to "False",
++            "dxvk.trackPipelineLifetime" to "False",
++        ),
++        binds = listOf("/dev/mali0:/dev/mali0"),
++        reason = reason,
++    )
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/backends/TurnipBackend.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/backends/TurnipBackend.kt
+new file mode 100644
+index 0000000..c513204
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/backends/TurnipBackend.kt
+@@ -0,0 +1,35 @@
++package com.droiddeck.launcher.gpu.probe.backends
++
++import com.droiddeck.launcher.gpu.probe.BackendPlan
++import com.droiddeck.launcher.gpu.probe.DriverRequirement
++import com.droiddeck.launcher.gpu.probe.GpuProbeResult
++import com.droiddeck.launcher.gpu.probe.RenderBackend
++import com.droiddeck.launcher.gpu.probe.Risk
++
++/**
++ * Turnip, the Mesa Vulkan driver for Adreno, built into the Linux runtime.
++ *
++ * This is the path the app was written for and the only one it has been validated on, so it is the
++ * only backend that may claim [Risk.SAFE]. Nothing about it changes for Adreno devices: the plan
++ * describes what the runtime already does, and exists so the choice between backends can be read in
++ * one place instead of inferred from four.
++ */
++object TurnipBackend : RenderBackend {
++    const val ID = "turnip"
++
++    override val id = ID
++
++    override fun evaluate(probe: GpuProbeResult): BackendPlan? {
++        if (!probe.isAdreno) return null
++        return BackendPlan(
++            backendId = ID,
++            displayName = "Turnip (Adreno)",
++            risk = Risk.SAFE,
++            gpuInGuest = true,
++            driverRequirement = DriverRequirement.RUNTIME_DEFAULT,
++            env = mapOf("MESA_LOADER_DRIVER_OVERRIDE" to "zink"),
++            binds = listOf("/dev/kgsl-3d0:/dev/dri/renderD128"),
++            reason = "Adreno with kgsl: the runtime's own Turnip drives it, as validated.",
++        )
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/gpu/probe/backends/VendorBridgeBackend.kt b/app/src/main/java/com/droiddeck/launcher/gpu/probe/backends/VendorBridgeBackend.kt
+new file mode 100644
+index 0000000..570bc8e
+--- /dev/null
++++ b/app/src/main/java/com/droiddeck/launcher/gpu/probe/backends/VendorBridgeBackend.kt
+@@ -0,0 +1,40 @@
++package com.droiddeck.launcher.gpu.probe.backends
++
++import com.droiddeck.launcher.gpu.probe.BackendPlan
++import com.droiddeck.launcher.gpu.probe.DriverRequirement
++import com.droiddeck.launcher.gpu.probe.GpuProbeResult
++import com.droiddeck.launcher.gpu.probe.GpuVendor
++import com.droiddeck.launcher.gpu.probe.RenderBackend
++import com.droiddeck.launcher.gpu.probe.Risk
++
++/**
++ * The placeholder for a GPU whose driver exists only as a bionic-linked vendor blob.
++ *
++ * This is a Kirin 9000S, 9010, 9020 - Huawei's Maleoon. It has a working Vulkan driver on Android and
++ * nothing a glibc guest can load: the blob is built against bionic, so `dlopen` in the container
++ * fails, and there is no Mesa backend for the architecture at all. The honest answer is that the
++ * guest cannot draw with this GPU today.
++ *
++ * The backend exists as a declared [Risk.BLOCKED] plan rather than as an absent one so the app can
++ * say *why* instead of falling through to "not an Adreno GPU", which is true but useless. The route
++ * out is a host-side Vulkan bridge, which is a separate project - see the roadmap.
++ */
++object VendorBridgeBackend : RenderBackend {
++    const val ID = "vendor-bridge"
++
++    override val id = ID
++
++    override fun evaluate(probe: GpuProbeResult): BackendPlan? {
++        if (probe.vendor != GpuVendor.HUAWEI_MALEOON) return null
++        return BackendPlan(
++            backendId = ID,
++            displayName = "Vendor bridge (${probe.deviceName})",
++            risk = Risk.BLOCKED,
++            gpuInGuest = false,
++            driverRequirement = DriverRequirement.NONE_AVAILABLE,
++            reason = "Maleoon has no open guest driver: Huawei's Vulkan blob is bionic-linked and cannot " +
++                "load in the glibc runtime, and no Mesa backend targets it. " +
++                "A host-side Vulkan bridge is required, and is not built yet.",
++        )
++    }
++}
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt b/app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt
+index a98dabc..dc6b7e2 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/SessionPrefs.kt
+@@ -324,6 +324,27 @@ object SessionPrefs {
+         prefs(context).edit().putString("gpuDriverMode", mode).apply()
+     }
+ 
++    /**
++     * Which render backend the session may use: the stored choice, as one of the three below.
++     *
++     * [GPU_BACKEND_AUTO] is the default for an install that never chose, and it only allows backends
++     * that have been validated. On a device with no validated backend it means CPU rendering - a
++     * slow session that works, rather than a fast one that takes the phone down with it.
++     */
++    const val GPU_BACKEND_AUTO = "auto"
++    const val GPU_BACKEND_HARDWARE = "hardware"
++    const val GPU_BACKEND_SOFTWARE = "software"
++
++    fun gpuBackend(context: Context): String =
++        prefs(context).getString("gpuBackend", GPU_BACKEND_AUTO)
++            ?.takeIf { it in setOf(GPU_BACKEND_AUTO, GPU_BACKEND_HARDWARE, GPU_BACKEND_SOFTWARE) }
++            ?: GPU_BACKEND_AUTO
++
++    fun setGpuBackend(context: Context, mode: String) {
++        require(mode in setOf(GPU_BACKEND_AUTO, GPU_BACKEND_HARDWARE, GPU_BACKEND_SOFTWARE))
++        prefs(context).edit().putString("gpuBackend", mode).apply()
++    }
++
+     fun settleGpuDriverMode(context: Context) {
+         val p = prefs(context)
+         if (p.contains("gpuDriverMode")) return
+diff --git a/app/src/main/java/com/droiddeck/launcher/session/SessionService.kt b/app/src/main/java/com/droiddeck/launcher/session/SessionService.kt
+index 101fb82..6c4e692 100644
+--- a/app/src/main/java/com/droiddeck/launcher/session/SessionService.kt
++++ b/app/src/main/java/com/droiddeck/launcher/session/SessionService.kt
+@@ -510,7 +510,14 @@ class SessionService : Service() {
+                 .onSuccess { if (it != null) Log.i(TAG, it) }
+                 .onFailure { Log.w(TAG, "forced components", it) }
+         }
+-        addClientEnvironment(guest, steamHere, agentEnvironment)
++        // Which driver draws, decided once by the backend layer rather than assumed to be Adreno.
++        // Computed here, before the environment is built, because both the output size and the
++        // guest environment depend on it: on a device whose GPU has no Linux driver this comes back
++        // as a CPU session, which is slower and has to be drawn smaller, and the Adreno-shaped
++        // environment would otherwise point at a driver that cannot initialize there.
++        val gpuPlan = com.droiddeck.launcher.gpu.probe.SessionGpu.plan(this)
++        com.droiddeck.launcher.gpu.probe.SessionGpu.log(gpuPlan)
++        addClientEnvironment(guest, steamHere, agentEnvironment, gpuPlan)
+         if (steamHere) guest.add("BL_EPIC_APP_ID=" + com.droiddeck.launcher.stores.epic.EpicClient.shortcutAppId)
+         val fastPathAt = guest.size
+ 
+@@ -522,8 +529,11 @@ class SessionService : Service() {
+             guest.add("BL_VENC_SOCKET=" + encoder.socket.absolutePath)
+         }
+ 
+-        guest.add("BL_WIDTH=" + size.first)
+-        guest.add("BL_HEIGHT=" + size.second)
++        // A CPU session cannot fill a 2844x1260 panel at a usable rate, so the device profile says
++        // how much to give up. The compositor scales the result back up, so the session still fills
++        // the screen - it is only drawn smaller.
++        guest.add("BL_WIDTH=" + com.droiddeck.launcher.gpu.probe.SessionGpu.scaledOutput(size.first, gpuPlan.resolutionScalePercent))
++        guest.add("BL_HEIGHT=" + com.droiddeck.launcher.gpu.probe.SessionGpu.scaledOutput(size.second, gpuPlan.resolutionScalePercent))
+         if (SessionState.followScreen || size.first < size.second ||
+             SessionPrefs.orientation(this) == android.content.pm.ActivityInfo.SCREEN_ORIENTATION_USER)
+             guest.add("BL_FOLLOW_OUTPUT=1")
+@@ -539,7 +549,12 @@ class SessionService : Service() {
+         // The WSI layer goes back to its default count while Steam's Frame Limit holds the game.
+         guest.add("GAMESCOPE_WSI_MIN_IMAGE_COUNT=8")
+         guest.add("GAMESCOPE_WSI_ENSURE_MIN_IMAGE_COUNT=1")
+-        guest.add("BL_REFRESH=" + Math.round(SessionState.refreshHz))
++        val sessionRefresh = if (gpuPlan.maxRefreshHz > 0) {
++            minOf(SessionState.refreshHz, gpuPlan.maxRefreshHz.toFloat())
++        } else {
++            SessionState.refreshHz
++        }
++        guest.add("BL_REFRESH=" + Math.round(sessionRefresh))
+         guest.add("BL_LOG=" + sessionLog.path)
+         guest.add("BL_DEBUG_DIR=" + sessionDir.path)
+ 
+@@ -750,7 +765,12 @@ class SessionService : Service() {
+         return sessionDir
+     }
+ 
+-    private fun addClientEnvironment(guest: MutableList<String>, steamHere: Boolean, agentEnvironment: List<String>) {
++    private fun addClientEnvironment(
++        guest: MutableList<String>,
++        steamHere: Boolean,
++        agentEnvironment: List<String>,
++        gpuPlan: com.droiddeck.launcher.gpu.probe.SessionGpuPlan,
++    ) {
+         guest.add("/usr/bin/env")
+         guest.add("-i")
+         guest.add("DROIDDECK_BWRAP_SOCKET=" + com.droiddeck.launcher.runtime.BwrapSpawner.socket(this))
+@@ -770,10 +790,21 @@ class SessionService : Service() {
+         guest.add("WAYLAND_DISPLAY=wayland-0")
+         guest.add("BL_ANDROID_CLIPBOARD=" + File(filesDir, "session/android-clipboard").path)
+         guest.add("GAMESCOPE_FORCE_GENERAL_QUEUE=1")
+-        guest.add("MESA_LOADER_DRIVER_OVERRIDE=zink")
+-        guest.add("GALLIUM_DRIVER=zink")
+-        guest.add("LIBGL_KOPPER_DRI2=true")
+-        LinuxRuntime.vulkanIcd(this)?.let { guest.add("VK_ICD_FILENAMES=" + it.path) }
++        if (gpuPlan.keepAdrenoDefaults) {
++            guest.add("MESA_LOADER_DRIVER_OVERRIDE=zink")
++            guest.add("GALLIUM_DRIVER=zink")
++            guest.add("LIBGL_KOPPER_DRI2=true")
++        } else {
++            for ((key, value) in gpuPlan.env) guest.add("$key=$value")
++            // A CPU renderer ships with the libraries it links against; the loader only looks in
++            // default paths, so the pack's own directory has to be named. The system paths come
++            // first on purpose: a measured runtime already carries most of these (libxcb, libdrm,
++            // libwayland) and its own builds must win over the older ones inside the pack, which is
++            // then only consulted for what the runtime really lacks.
++            gpuPlan.libraryDir?.let { guest.add("LD_LIBRARY_PATH=/usr/lib:/lib:$it") }
++        }
++        (gpuPlan.icdPath ?: LinuxRuntime.vulkanIcd(this)?.path)
++            ?.let { guest.add("VK_ICD_FILENAMES=" + it) }
+         val linuxDriverId = SessionPrefs.linuxDriver(this)
+         SessionState.runtimeDriver = linuxDriverId
+         com.droiddeck.launcher.gpu.AutoDriverTrial.sessionStarting(
+@@ -782,11 +813,16 @@ class SessionService : Service() {
+                 ?: SessionPrefs.androidDriver(this),
+             linuxDriverId,
+         )
+-        LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
+-            ?.let { guest.add(LinuxVulkanDriver.ENV + "=" + it) }
+-        val tuOverride = tuDebugOverride()
+-        val tuDriver = sysmemDriver(linuxDriverId)
+-        (tuOverride ?: "sysmem".takeIf { tuDriver || SessionPrefs.tuSysmem(this) })?.let { guest.add("TU_DEBUG=$it") }
++        // Turnip's own knobs only mean something when Turnip is the driver. On a software session
++        // BL_VK_DRIVER would override the CPU ICD we just chose, which is the opposite of intended.
++        // They stay declared outside the branch because the game environment below reads them.
++        val tuOverride = if (gpuPlan.software) null else tuDebugOverride()
++        val tuDriver = if (gpuPlan.software) false else sysmemDriver(linuxDriverId)
++        if (!gpuPlan.software) {
++            LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
++                ?.let { guest.add(LinuxVulkanDriver.ENV + "=" + it) }
++            (tuOverride ?: "sysmem".takeIf { tuDriver || SessionPrefs.tuSysmem(this) })?.let { guest.add("TU_DEBUG=$it") }
++        }
+         if (SessionPrefs.zinkLazy(this)) {
+             guest.add("ZINK_DESCRIPTORS=lazy")
+             guest.add("ZINK_DEBUG=compact")
+diff --git a/app/src/main/java/com/droiddeck/launcher/ui/FrontEndSetup.kt b/app/src/main/java/com/droiddeck/launcher/ui/FrontEndSetup.kt
+index db95568..4230462 100644
+--- a/app/src/main/java/com/droiddeck/launcher/ui/FrontEndSetup.kt
++++ b/app/src/main/java/com/droiddeck/launcher/ui/FrontEndSetup.kt
+@@ -234,16 +234,22 @@ internal fun SetupPanel(
+                 when (tab) {
+                     0 -> {
+                         val gpuCheck: @Composable (Boolean) -> Unit = { divider ->
++                            // A Maleoon is not "unsupported" in the sense the old wording meant:
++                            // the session does start, on the CPU. Saying so is more useful than
++                            // telling someone their phone needs a Snapdragon.
++                            val maleoon = gpu.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALEOON
+                             CheckRow(
+                                 if (gpuOk) CheckState.OK else CheckState.WARN,
+-                                when (gpu.support) {
+-                                    com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_supported)
+-                                    com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested)
++                                when {
++                                    maleoon -> stringResource(R.string.setup_gpu_software)
++                                    gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_supported)
++                                    gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested)
+                                     else -> stringResource(R.string.setup_gpu_unsupported)
+                                 },
+-                                when (gpu.support) {
+-                                    com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_detail, gpu.displayName(ctx), gpuName)
+-                                    com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested_detail, gpu.displayName(ctx), gpu.supportText(ctx).replaceFirstChar { it.lowercase() })
++                                when {
++                                    maleoon -> stringResource(R.string.setup_gpu_software_detail, gpu.displayName(ctx))
++                                    gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_detail, gpu.displayName(ctx), gpuName)
++                                    gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested_detail, gpu.displayName(ctx), gpu.supportText(ctx).replaceFirstChar { it.lowercase() })
+                                     else -> stringResource(R.string.setup_gpu_unsupported_detail, gpuName)
+                                 },
+                                 divider = divider,
+diff --git a/app/src/main/res/values-zh-rCN/strings.xml b/app/src/main/res/values-zh-rCN/strings.xml
+index b14b566..d0d13b3 100644
+--- a/app/src/main/res/values-zh-rCN/strings.xml
++++ b/app/src/main/res/values-zh-rCN/strings.xml
+@@ -701,6 +701,8 @@
+     <string name="setup_gpu_supported">设备受支持</string>
+     <string name="setup_gpu_untested">未经测试的 GPU</string>
+     <string name="setup_gpu_unsupported">GPU 不受支持</string>
++    <string name="setup_gpu_software">只能软件渲染</string>
++    <string name="setup_gpu_software_detail">%1$s 没有 Linux 驱动；会话将用 CPU 渲染，游戏会很慢</string>
+     <string name="setup_gpu_detail">%1$s · %2$s</string>
+     <string name="setup_gpu_untested_detail">%1$s：%2$s</string>
+     <string name="setup_gpu_unsupported_detail">Steam 需要 Adreno 驱动；%1$s 可能显示黑屏</string>
+@@ -1314,6 +1316,8 @@
+     <string name="main_pick_roms">选择 ROM 文件夹</string>
+     <string name="main_non_adreno_title">不是 Adreno GPU</string>
+     <string name="main_non_adreno_text">Turnip 支持 Adreno GPU。在 %1$s 上，Steam 可能显示黑屏。需下载：%2$.0f MB。</string>
++    <string name="main_software_render_title">此芯片没有 Linux GPU 驱动</string>
++    <string name="main_software_render_text">Turnip 只驱动 Adreno。在 %1$s 上，会话将改用 CPU 软件渲染：启动器与桌面可用，游戏会很慢。请先导入软件 Vulkan 驱动。需下载：%2$.0f MB。</string>
+     <string name="main_install_anyway">仍要安装</string>
+     <string name="main_remove_runtime_title">移除 Linux 运行时</string>
+     <string name="main_remove_runtime_text">这会删除运行时、其中的 Steam 客户端，以及安装在其中的所有游戏。</string>
+diff --git a/app/src/main/res/values-zh-rHK/strings.xml b/app/src/main/res/values-zh-rHK/strings.xml
+index 4a9c6ee..9470275 100644
+--- a/app/src/main/res/values-zh-rHK/strings.xml
++++ b/app/src/main/res/values-zh-rHK/strings.xml
+@@ -701,6 +701,8 @@
+     <string name="setup_gpu_supported">裝置受支援</string>
+     <string name="setup_gpu_untested">未經測試的 GPU</string>
+     <string name="setup_gpu_unsupported">GPU 不受支援</string>
++    <string name="setup_gpu_software">只能軟體算圖</string>
++    <string name="setup_gpu_software_detail">%1$s 沒有 Linux 驅動；工作階段將用 CPU 算圖，遊戲會很慢</string>
+     <string name="setup_gpu_detail">%1$s · %2$s</string>
+     <string name="setup_gpu_untested_detail">%1$s：%2$s</string>
+     <string name="setup_gpu_unsupported_detail">Steam 需要 Adreno 驅動程式；%1$s 可能會出現黑畫面</string>
+@@ -1231,6 +1233,8 @@
+     <string name="main_pick_roms">選擇 ROM 資料夾</string>
+     <string name="main_non_adreno_title">不是 Adreno GPU</string>
+     <string name="main_non_adreno_text">Turnip 支援 Adreno GPU。在 %1$s 上，Steam 可能會出現黑畫面。下載大小：%2$.0f MB。</string>
++    <string name="main_software_render_title">此晶片沒有 Linux GPU 驅動</string>
++    <string name="main_software_render_text">Turnip 只驅動 Adreno。在 %1$s 上，工作階段將改用 CPU 軟體算圖：啟動器與桌面可用，遊戲會很慢。請先匯入軟體 Vulkan 驅動。下載大小：%2$.0f MB。</string>
+     <string name="main_install_anyway">仍要安裝</string>
+     <string name="main_remove_runtime_title">移除 Linux 運行環境</string>
+     <string name="main_remove_runtime_text">此操作會刪除運行環境、其中的 Steam 用戶端，以及安裝在其中的所有遊戲。</string>
+diff --git a/app/src/main/res/values-zh-rTW/strings.xml b/app/src/main/res/values-zh-rTW/strings.xml
+index 9d5adf6..699c2b9 100644
+--- a/app/src/main/res/values-zh-rTW/strings.xml
++++ b/app/src/main/res/values-zh-rTW/strings.xml
+@@ -701,6 +701,8 @@
+     <string name="setup_gpu_supported">裝置受支援</string>
+     <string name="setup_gpu_untested">未經測試的 GPU</string>
+     <string name="setup_gpu_unsupported">GPU 不受支援</string>
++    <string name="setup_gpu_software">只能軟體算圖</string>
++    <string name="setup_gpu_software_detail">%1$s 沒有 Linux 驅動；工作階段將用 CPU 算圖，遊戲會很慢</string>
+     <string name="setup_gpu_detail">%1$s · %2$s</string>
+     <string name="setup_gpu_untested_detail">%1$s：%2$s</string>
+     <string name="setup_gpu_unsupported_detail">Steam 需要 Adreno 驅動程式；%1$s 可能出現黑畫面。</string>
+@@ -1231,6 +1233,8 @@
+     <string name="main_pick_roms">選擇 ROM 資料夾</string>
+     <string name="main_non_adreno_title">不是 Adreno GPU</string>
+     <string name="main_non_adreno_text">Turnip 支援 Adreno GPU。在 %1$s 上，Steam 可能會出現黑畫面。下載大小：%2$.0f MB。</string>
++    <string name="main_software_render_title">此晶片沒有 Linux GPU 驅動</string>
++    <string name="main_software_render_text">Turnip 只驅動 Adreno。在 %1$s 上，工作階段將改用 CPU 軟體算圖：啟動器與桌面可用，遊戲會很慢。請先匯入軟體 Vulkan 驅動。下載大小：%2$.0f MB。</string>
+     <string name="main_install_anyway">仍要安裝</string>
+     <string name="main_remove_runtime_title">移除 Linux 執行環境</string>
+     <string name="main_remove_runtime_text">這會刪除執行環境、其中的 Steam 用戶端，以及安裝在其中的所有遊戲。</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index ad44ccb..36f8548 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -771,6 +771,8 @@
+     <string name="setup_gpu_supported">Device supported</string>
+     <string name="setup_gpu_untested">Untested GPU</string>
+     <string name="setup_gpu_unsupported">GPU not supported</string>
++    <string name="setup_gpu_software">CPU rendering only</string>
++    <string name="setup_gpu_software_detail">%1$s has no Linux driver; sessions render on the CPU and games are slow</string>
+     <string name="setup_gpu_detail">%1$s · %2$s</string>
+     <string name="setup_gpu_untested_detail">%1$s: %2$s</string>
+     <string name="setup_gpu_unsupported_detail">Steam needs an Adreno driver; %1$s may show a black screen</string>
+@@ -1374,6 +1376,8 @@
+     <string name="main_pick_roms">Choose the ROMs folder</string>
+     <string name="main_non_adreno_title">Not an Adreno GPU</string>
+     <string name="main_non_adreno_text">Turnip supports Adreno GPUs. On %1$s, Steam may show a black screen. Download: %2$.0f MB.</string>
++    <string name="main_software_render_title">This chip has no Linux GPU driver</string>
++    <string name="main_software_render_text">Turnip only drives Adreno. On %1$s the session will render on the CPU instead: the launcher and the desktop work, games are slow. Import a software Vulkan driver first. Download: %2$.0f MB.</string>
+     <string name="main_install_anyway">Install anyway</string>
+     <string name="main_remove_runtime_title">Remove Linux runtime</string>
+     <string name="main_remove_runtime_text">This deletes the runtime, the Steam client inside it, and every game installed there.</string>
+@@ -2013,6 +2017,8 @@
+     <string name="gpuinfo_a850_experimental">Experimental Adreno 850 support: requires compatible experimental display and game drivers; not verified on this device</string>
+     <string name="gpuinfo_below_tested">Below tested hardware (Adreno 725 and newer): it may not run</string>
+     <string name="gpuinfo_unsupported">Not supported: DroidDeck needs an Adreno (Snapdragon) GPU</string>
++    <string name="gpuinfo_mali_experimental">Experimental ARM Mali (Kirin 9000 and older): needs an imported PanVK-kbase driver, and Steam is not validated on this device</string>
++    <string name="gpuinfo_maleoon_software">Huawei Maleoon (Kirin 9000S and newer) has no Linux driver: sessions can run, but only with CPU rendering</string>
+ 
+     <string name="turnip_rate_limited">GitHub\'s rate limit was hit - try again later</string>
+     <string name="turnip_github_http">GitHub answered HTTP %1$d</string>
+diff --git a/app/src/test/java/com/droiddeck/launcher/gpu/DriverPackEntryTest.kt b/app/src/test/java/com/droiddeck/launcher/gpu/DriverPackEntryTest.kt
+new file mode 100644
+index 0000000..6609fae
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/gpu/DriverPackEntryTest.kt
+@@ -0,0 +1,124 @@
++package com.droiddeck.launcher.gpu
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++import org.junit.runner.RunWith
++import org.robolectric.RobolectricTestRunner
++import java.io.File
++import java.nio.file.Files
++
++/**
++ * Which library inside an imported pack the loader should open.
++ *
++ * The importer used to accept exactly one file name, which was fine while Turnip was the only driver
++ * anyone could import. A CPU renderer arrives as a directory of libraries, so the entry point has to
++ * be chosen rather than assumed.
++ */
++// Robolectric, because the install check parses the manifest with org.json: the plain JVM test
++// classpath only has Android's stubbed copy, which throws on construction.
++@RunWith(RobolectricTestRunner::class)
++class DriverPackEntryTest {
++
++    private fun libs(vararg names: String) = names.associateWith { File(it) }
++
++    @Test fun aPackThatNamesItsEntryPointGetsIt() {
++        val pack = libs("libvulkan_lvp.so", "libLLVM-11.so.1", "libdrm.so.2")
++        assertEquals("libvulkan_lvp.so", LinuxVulkanDriverManager.pickEntry(pack, "libvulkan_lvp.so"))
++    }
++
++    @Test fun aDeclaredEntryThatIsNotThereIsNotSilentlyReplaced() {
++        // Better to fail the import than to open a different library than the pack asked for.
++        val pack = libs("libvulkan_lvp.so", "libLLVM-11.so.1")
++        assertNull(LinuxVulkanDriverManager.pickEntry(pack, "libvulkan_freedreno.so"))
++    }
++
++    @Test fun aTurnipPackWithoutAManifestStillWorks() {
++        // Every pack published before this change looks like this, and must keep importing.
++        assertEquals("libvulkan_freedreno.so", LinuxVulkanDriverManager.pickEntry(libs("libvulkan_freedreno.so"), ""))
++        assertEquals(
++            "libvulkan_freedreno.so",
++            LinuxVulkanDriverManager.pickEntry(libs("libLLVM-11.so.1", "libvulkan_freedreno.so"), ""),
++        )
++    }
++
++    @Test fun aCpuRendererPackWithoutAManifestIsRecognised() {
++        assertEquals(
++            "libvulkan_lvp.so",
++            LinuxVulkanDriverManager.pickEntry(libs("libLLVM-11.so.1", "libvulkan_lvp.so"), ""),
++        )
++    }
++
++    /**
++     * The version the generated manifest declares.
++     *
++     * Declaring 1.1 for a 1.4 driver is not cosmetic: the loader treats the driver as 1.1, and a
++     * compositor that requires 1.3 then reports no physical device while the driver is loaded and
++     * enumerable. Measured on a Kirin 9010 with lavapipe 26.2.
++     */
++    @Test fun aPackStatesItsOwnVulkanVersion() {
++        assertEquals("1.4.0", LinuxVulkanDriverManager.apiVersion("1.4.0"))
++    }
++
++    @Test fun aPackThatSaysNothingKeepsTheHistoricalVersion() {
++        // Every Turnip pack published so far looks like this and must import unchanged.
++        assertEquals("1.1.274", LinuxVulkanDriverManager.apiVersion(null))
++        assertEquals("1.1.274", LinuxVulkanDriverManager.apiVersion(""))
++        assertEquals("1.1.274", LinuxVulkanDriverManager.apiVersion("  "))
++    }
++
++    @Test fun aMalformedVersionFallsBackRatherThanWritingGarbage() {
++        // A manifest with an unparsable version makes the loader drop the whole ICD.
++        assertEquals("1.1.274", LinuxVulkanDriverManager.apiVersion("1.4"))
++        assertEquals("1.1.274", LinuxVulkanDriverManager.apiVersion("latest"))
++    }
++
++    @Test fun aPackWithNoVulkanDriverIsRefused() {
++        assertNull(LinuxVulkanDriverManager.pickEntry(libs("libLLVM-11.so.1", "libdrm.so.2"), ""))
++        assertNull(LinuxVulkanDriverManager.pickEntry(emptyMap(), ""))
++    }
++
++    /**
++     * An installed pack is recognised by what its own manifest points at.
++     *
++     * The first version of this checked for `libvulkan_freedreno.so` by name, which meant a
++     * correctly imported CPU renderer existed on disk and was invisible in the driver list.
++     */
++    @Test fun anInstallIsRecognisedByItsManifestNotAFixedFileName() {
++        val dir = Files.createTempDirectory("lvd-manifest").toFile()
++        try {
++            val lib = File(dir, "libvulkan_lvp.so").apply { writeText("not a real library") }
++            // Forward slashes: a Windows temp path in a JSON string needs escaping otherwise, and
++            // Android paths look like this anyway.
++            val path = lib.absolutePath.replace('\\', '/')
++            File(dir, "icd.json").writeText("""{"ICD":{"library_path":"$path"}}""")
++            assertEquals(lib.absolutePath, LinuxVulkanDriverManager.libraryOf(dir)?.absolutePath)
++        } finally {
++            dir.deleteRecursively()
++        }
++    }
++
++    @Test fun anOlderInstallWithTheFixedNameStillCounts() {
++        val dir = Files.createTempDirectory("lvd-legacy").toFile()
++        try {
++            val lib = File(dir, LinuxVulkanDriverManager.LIB_NAME).apply { writeText("x") }
++            // No manifest at all: the historical layout is all there is to go on.
++            assertEquals(lib.absolutePath, LinuxVulkanDriverManager.libraryOf(dir)?.absolutePath)
++        } finally {
++            dir.deleteRecursively()
++        }
++    }
++
++    @Test fun aManifestPointingAtNothingFallsBackRatherThanClaimingInstalled() {
++        val dir = Files.createTempDirectory("lvd-broken").toFile()
++        try {
++            File(dir, "icd.json").writeText("""{"ICD":{"library_path":"/nowhere/libvulkan_lvp.so"}}""")
++            assertNull(LinuxVulkanDriverManager.libraryOf(dir))
++            // And with the legacy name present, the fallback still finds it.
++            val legacy = File(dir, LinuxVulkanDriverManager.LIB_NAME).apply { writeText("x") }
++            assertEquals(legacy.absolutePath, LinuxVulkanDriverManager.libraryOf(dir)?.absolutePath)
++        } finally {
++            dir.deleteRecursively()
++        }
++    }
++}
+diff --git a/app/src/test/java/com/droiddeck/launcher/gpu/KirinSupportTierTest.kt b/app/src/test/java/com/droiddeck/launcher/gpu/KirinSupportTierTest.kt
+new file mode 100644
+index 0000000..b316d40
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/gpu/KirinSupportTierTest.kt
+@@ -0,0 +1,53 @@
++package com.droiddeck.launcher.gpu
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * The tiers a Kirin device lands in, and the words it is shown.
++ *
++ * Mali is UNTESTED rather than UNSUPPORTED because an imported PanVK driver can drive it; Maleoon is
++ * UNSUPPORTED for hardware but must not be told "buy a Snapdragon", because the session does run -
++ * on the CPU.
++ */
++class KirinSupportTierTest {
++
++    private fun info(family: GpuInfo.Family, name: String = "x") =
++        GpuInfo(name = name, model = 0, family = family, soc = "", oneUi8Gen2 = false)
++
++    @Test fun maliIsExperimentalNotUnsupported() {
++        val mali = info(GpuInfo.Family.MALI, "Mali-G78 MP24")
++        assertEquals(GpuInfo.Support.UNTESTED, mali.support)
++        assertTrue(mali.supportText.contains("PanVK"))
++        assertTrue(mali.supportText.contains("not validated"))
++    }
++
++    @Test fun maleoonSaysSoftwareNotUnsupportedGpu() {
++        val maleoon = info(GpuInfo.Family.MALEOON, "Maleoon 910")
++        assertEquals(GpuInfo.Support.UNSUPPORTED, maleoon.support)
++        assertTrue(maleoon.supportText.contains("CPU rendering"))
++        // The old line would be technically true and practically useless here.
++        assertTrue(!maleoon.supportText.contains("Snapdragon"))
++    }
++
++    @Test fun aVendorWithNoBackendKeepsTheOldWording() {
++        // Xclipse, PowerVR and an unnamed GPU all stay NOT_ADRENO, so this wording is what they get.
++        assertEquals("Not supported: DroidDeck needs an Adreno (Snapdragon) GPU", info(GpuInfo.Family.NOT_ADRENO).supportText)
++    }
++
++    @Test fun adrenoTiersAreUntouched() {
++        // Same assertions the existing GpuDetectionTest makes, restated here so a change to the
++        // shared `support` rule cannot pass by only one of the two files.
++        val tested = GpuInfo("Adreno 830", 830, GpuInfo.familyOf(true, 830), "", false)
++        assertEquals(GpuInfo.Support.TESTED, tested.support)
++        assertEquals("Supported", tested.supportText)
++        val unknown = GpuInfo("Adreno", 0, GpuInfo.familyOf(true, 0), "", false)
++        assertEquals(GpuInfo.Support.UNTESTED, unknown.support)
++    }
++
++    @Test fun theVendorDefaultsToQualcommSoOldConstructionStillMeansAdreno() {
++        val gpu = GpuInfo("Adreno 740", 740, GpuInfo.Family.A7XX, "", false)
++        assertEquals(com.droiddeck.launcher.gpu.probe.GpuVendor.QUALCOMM, gpu.vendor)
++    }
++}
+diff --git a/app/src/test/java/com/droiddeck/launcher/gpu/probe/BackendSelectionTest.kt b/app/src/test/java/com/droiddeck/launcher/gpu/probe/BackendSelectionTest.kt
+new file mode 100644
+index 0000000..792885d
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/gpu/probe/BackendSelectionTest.kt
+@@ -0,0 +1,121 @@
++package com.droiddeck.launcher.gpu.probe
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class BackendSelectionTest {
++
++    private val adreno = GpuProbe.probe(
++        FakeEnv(files = setOf(DriverPaths.KGSL), contents = mapOf("/sys/class/kgsl/kgsl-3d0/gpu_model" to "Adreno740"))
++    )
++
++    private val maliCsf = GpuProbe.probe(
++        FakeEnv(
++            files = setOf(DriverPaths.MALI_DEV, DriverPaths.MALI_CSF),
++            contents = mapOf(DriverPaths.MALI_CSF to "1"),
++            vulkanDeviceName = "Mali-G615 MC6",
++        )
++    )
++
++    private val kirin9000 = GpuProbe.probe(
++        FakeEnv(files = setOf(DriverPaths.MALI_DEV), props = mapOf("ro.board.platform" to "kirin9000"))
++    )
++
++    private val kirin9000s = GpuProbe.probe(
++        FakeEnv(props = mapOf("ro.board.platform" to "kirin9000s"))
++    )
++
++    @Test fun adrenoIsUnchangedInEveryPolicy() {
++        // The point of the whole layer: adding vendors must not move the validated path.
++        for (policy in GpuPolicy.values()) {
++            val chosen = BackendRegistry.select(adreno, policy).chosen
++            if (policy == GpuPolicy.FORCE_SOFTWARE) {
++                assertEquals("lavapipe", chosen.backendId)
++            } else {
++                assertEquals("turnip", chosen.backendId)
++                assertEquals(Risk.SAFE, chosen.risk)
++                assertTrue(chosen.gpuInGuest)
++            }
++        }
++    }
++
++    @Test fun theDefaultPolicyNeverHandsAnUnvalidatedGpuToTheGuest() {
++        // Mali and Maleoon both default to CPU rendering: a slow session beats a kernel hang.
++        assertEquals("lavapipe", BackendRegistry.select(maliCsf, GpuPolicy.AUTO).chosen.backendId)
++        assertEquals("lavapipe", BackendRegistry.select(kirin9000, GpuPolicy.AUTO).chosen.backendId)
++        assertEquals("lavapipe", BackendRegistry.select(kirin9000s, GpuPolicy.AUTO).chosen.backendId)
++    }
++
++    @Test fun theDefaultPolicyStillOffersTheExperimentalPathInTheCandidates() {
++        // Auto does not use PanVK, but the device card has to be able to say it exists.
++        val decision = BackendRegistry.select(maliCsf, GpuPolicy.AUTO)
++        val panvk = decision.candidates.first { it.backendId == "panvk-kbase" }
++        assertEquals(Risk.EXPERIMENTAL, panvk.risk)
++        assertEquals(DriverRequirement.IMPORTED_ICD, panvk.driverRequirement)
++    }
++
++    @Test fun askingForHardwareOnAValidatedMaliGetsPanVk() {
++        val chosen = BackendRegistry.select(maliCsf, GpuPolicy.PREFER_HARDWARE).chosen
++        assertEquals("panvk-kbase", chosen.backendId)
++        assertEquals(Risk.EXPERIMENTAL, chosen.risk)
++        assertTrue(chosen.gpuInGuest)
++    }
++
++    @Test fun askingForHardwareStillDoesNotPickABlockedBackend() {
++        // Kirin 9000 is Job Manager, and the public PanVK-kbase builds are CSF-only.
++        val decision = BackendRegistry.select(kirin9000, GpuPolicy.PREFER_HARDWARE)
++        assertEquals("lavapipe", decision.chosen.backendId)
++        val blocked = decision.candidates.first { it.backendId == "panvk-kbase" }
++        assertEquals(Risk.BLOCKED, blocked.risk)
++        assertFalse(blocked.gpuInGuest)
++    }
++
++    @Test fun maleoonIsBlockedForHardwareAndExplainsWhy() {
++        val decision = BackendRegistry.select(kirin9000s, GpuPolicy.PREFER_HARDWARE)
++        assertEquals("lavapipe", decision.chosen.backendId)
++        val bridge = decision.candidates.first { it.backendId == "vendor-bridge" }
++        assertEquals(Risk.BLOCKED, bridge.risk)
++        assertTrue(bridge.reason.contains("bionic"))
++    }
++
++    @Test fun theMaliGpuIsBoundAsMaliAndNotDisguisedAsADrmNode() {
++        // Handing /dev/mali0 over as /dev/dri/renderD* invites DRM ioctls at a driver that never
++        // implemented them. PanVK opens the kbase node itself.
++        val panvk = BackendRegistry.select(maliCsf, GpuPolicy.PREFER_HARDWARE).chosen
++        assertEquals(listOf("/dev/mali0:/dev/mali0"), panvk.binds)
++        assertTrue(panvk.binds.none { it.contains("renderD") })
++        assertTrue(panvk.binds.none { it.contains("dri") })
++    }
++
++    @Test fun theCpuBackendNeverBindsAGpuNodeWhateverTheDevice() {
++        for (probe in listOf(adreno, maliCsf, kirin9000, kirin9000s)) {
++            val chosen = BackendRegistry.select(probe, GpuPolicy.FORCE_SOFTWARE).chosen
++            assertEquals("lavapipe", chosen.backendId)
++            assertEquals(DriverRequirement.CPU_SOFTWARE, chosen.driverRequirement)
++            assertTrue(chosen.binds.isEmpty())
++            assertFalse(chosen.gpuInGuest)
++        }
++    }
++
++    @Test fun thereIsAlwaysAnAnswer() {
++        // No device may fall through to "nothing can draw": that is the black-screen bug.
++        val unknown = GpuProbe.probe(FakeEnv())
++        for (probe in listOf(adreno, maliCsf, kirin9000, kirin9000s, unknown)) {
++            for (policy in GpuPolicy.values()) {
++                val decision = BackendRegistry.select(probe, policy)
++                assertTrue(decision.chosen.risk != Risk.BLOCKED)
++                assertTrue(decision.candidates.isNotEmpty())
++            }
++        }
++    }
++
++    @Test fun theMaliPlanCarriesTheTuningThatKeepsDxvkAlive() {
++        // Unified memory: without a capped heap DXVK allocates in 256 MiB chunks and dies.
++        val panvk = BackendRegistry.select(maliCsf, GpuPolicy.PREFER_HARDWARE).chosen
++        assertEquals("0.12", panvk.env["PANVK_HEAP_MEMORY_PERCENT"])
++        assertEquals("384", panvk.dxvk["dxvk.maxMemoryBudget"])
++        assertEquals("mali", panvk.env["BL_GPU_FAMILY"])
++    }
++}
+diff --git a/app/src/test/java/com/droiddeck/launcher/gpu/probe/DeviceProfilesTest.kt b/app/src/test/java/com/droiddeck/launcher/gpu/probe/DeviceProfilesTest.kt
+new file mode 100644
+index 0000000..c96f195
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/gpu/probe/DeviceProfilesTest.kt
+@@ -0,0 +1,61 @@
++package com.droiddeck.launcher.gpu.probe
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * Kirin 9010 is the device this was built for first, so its tuning is asserted first.
++ */
++class DeviceProfilesTest {
++
++    private fun kirin(platform: String) = GpuProbe.probe(FakeEnv(props = mapOf("ro.board.platform" to platform)))
++
++    @Test fun kirin9010GetsSoftwareTuningAndSaysWhy() {
++        val probe = kirin("kirin9010")
++        val tuning = DeviceProfiles.forProbe(probe, cpuCores = 8)!!
++        assertEquals("Kirin 9010 (software)", tuning.label)
++        assertEquals(60, tuning.resolutionScalePercent)
++        assertEquals(60, tuning.maxRefreshHz)
++        // Both of these need a Vulkan device the device does not have.
++        assertFalse(tuning.frameGeneration)
++        assertFalse(tuning.upscaling)
++        assertTrue(tuning.notes.any { it.contains("Maleoon 910") })
++        assertTrue(tuning.notes.any { it.contains("CPU") })
++    }
++
++    @Test fun theThreadCountLeavesCoresForAndroidAndSteam() {
++        // 8 cores -> 6 workers, never the whole SoC: starving the compositor makes it worse, not better.
++        assertEquals("6", DeviceProfiles.forProbe(kirin("kirin9010"), cpuCores = 8)!!.env["LP_NUM_THREADS"])
++        assertEquals("2", DeviceProfiles.forProbe(kirin("kirin9010"), cpuCores = 4)!!.env["LP_NUM_THREADS"])
++        assertEquals("6", DeviceProfiles.forProbe(kirin("kirin9010"), cpuCores = 12)!!.env["LP_NUM_THREADS"])
++    }
++
++    @Test fun everyMaleoonEraPartSharesTheTuning() {
++        // Same GPU family, same reason: 9000S, 9010 and 9020 are one problem.
++        for (soc in listOf("kirin9000s", "kirin9010", "kirin9020", "kirin9020a")) {
++            val tuning = DeviceProfiles.forProbe(kirin(soc))!!
++            assertEquals(soc, 60, tuning.resolutionScalePercent)
++            assertFalse(soc, tuning.frameGeneration)
++        }
++    }
++
++    @Test fun maliEraKirinGetsNoOverride() {
++        // Kirin 9000 and older can be handed to PanVK; overriding its resolution would be guessing.
++        assertNull(DeviceProfiles.forProbe(kirin("kirin9000")))
++        assertNull(DeviceProfiles.forProbe(kirin("kirin970")))
++    }
++
++    @Test fun adrenoIsNotProfiledHereAtAll() {
++        val adreno = GpuProbe.probe(
++            FakeEnv(files = setOf(DriverPaths.KGSL), contents = mapOf("/sys/class/kgsl/kgsl-3d0/gpu_model" to "Adreno740"))
++        )
++        assertNull(DeviceProfiles.forProbe(adreno))
++    }
++
++    @Test fun aNonKirinDeviceIsNotGivenKirinTuning() {
++        assertNull(DeviceProfiles.forProbe(GpuProbe.probe(FakeEnv())))
++    }
++}
+diff --git a/app/src/test/java/com/droiddeck/launcher/gpu/probe/FakeEnv.kt b/app/src/test/java/com/droiddeck/launcher/gpu/probe/FakeEnv.kt
+new file mode 100644
+index 0000000..1d35775
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/gpu/probe/FakeEnv.kt
+@@ -0,0 +1,24 @@
++package com.droiddeck.launcher.gpu.probe
++
++/** A device described instead of attached, so detection rules can be asserted on a build machine. */
++internal class FakeEnv(
++    private val files: Set<String> = emptySet(),
++    private val contents: Map<String, String> = emptyMap(),
++    private val props: Map<String, String> = emptyMap(),
++    override val sdkInt: Int = 34,
++    override val hardware: String = "",
++    override val manufacturer: String = "",
++    override val vulkanDeviceName: String? = null,
++) : ProbeEnv {
++    override fun exists(path: String): Boolean = path in files || path in contents
++
++    override fun readText(path: String): String? = contents[path]
++
++    override fun property(name: String): String = props[name].orEmpty()
++
++    override fun list(dir: String): List<String> = (files + contents.keys)
++        .filter { it.substringBeforeLast('/', "") == dir }
++        .map { it.substringAfterLast('/') }
++        .distinct()
++        .sorted()
++}
+diff --git a/app/src/test/java/com/droiddeck/launcher/gpu/probe/GpuProbeTest.kt b/app/src/test/java/com/droiddeck/launcher/gpu/probe/GpuProbeTest.kt
+new file mode 100644
+index 0000000..fab6ca7
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/gpu/probe/GpuProbeTest.kt
+@@ -0,0 +1,135 @@
++package com.droiddeck.launcher.gpu.probe
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class GpuProbeTest {
++
++    private fun probe(env: FakeEnv) = GpuProbe.probe(env)
++
++    @Test fun adrenoIsRecognisedByItsOwnNodeAndNothingElse() {
++        val result = probe(
++            FakeEnv(
++                files = setOf(DriverPaths.KGSL, DriverPaths.ADRENO_VULKAN),
++                contents = mapOf("/sys/class/kgsl/kgsl-3d0/gpu_model" to "Adreno740v2"),
++                hardware = "kalama",
++            )
++        )
++        assertEquals(GpuVendor.QUALCOMM, result.vendor)
++        assertEquals(740, result.adrenoModel)
++        assertEquals("Adreno 740", result.deviceName)
++        assertEquals(DriverPaths.KGSL, result.kernelNode)
++        assertTrue(result.isAdreno)
++    }
++
++    @Test fun adrenoWinsEvenWhenAMaliNodeIsAlsoPresent() {
++        // A device that exposes both is a Qualcomm one with a stray node; picking Mali there would
++        // hand a working phone a driver it does not need.
++        val result = probe(FakeEnv(files = setOf(DriverPaths.KGSL, DriverPaths.MALI_DEV)))
++        assertEquals(GpuVendor.QUALCOMM, result.vendor)
++    }
++
++    @Test fun aKirin9000IsMaliOnJobManager() {
++        val result = probe(
++            FakeEnv(
++                files = setOf(DriverPaths.MALI_DEV),
++                props = mapOf("ro.board.platform" to "kirin9000"),
++                hardware = "kirin9000",
++                manufacturer = "HUAWEI",
++            )
++        )
++        assertEquals(GpuVendor.ARM_MALI, result.vendor)
++        assertEquals("Mali-G78 MP24", result.deviceName)
++        assertEquals(KbaseInterface.JM, result.kbase)
++        assertEquals("kirin9000", result.kirin?.id)
++        assertTrue(result.isMaliKirin)
++    }
++
++    @Test fun aKirin970IsStillMaliButAnOlderOne() {
++        val result = probe(
++            FakeEnv(
++                files = setOf(DriverPaths.MALI_DEV),
++                props = mapOf("ro.board.platform" to "hi3670"),
++            )
++        )
++        assertEquals(GpuVendor.ARM_MALI, result.vendor)
++        assertEquals("kirin970", result.kirin?.id)
++        assertEquals("Mali-G72 MP12", result.deviceName)
++        assertEquals(KbaseInterface.JM, result.kbase)
++    }
++
++    @Test fun csfIsReadFromTheKernelNotGuessedFromTheName() {
++        val result = probe(
++            FakeEnv(
++                files = setOf(DriverPaths.MALI_DEV, DriverPaths.MALI_CSF),
++                contents = mapOf(DriverPaths.MALI_CSF to "1"),
++                vulkanDeviceName = "Mali-G615 MC6",
++            )
++        )
++        assertEquals(GpuVendor.ARM_MALI, result.vendor)
++        assertEquals(KbaseInterface.CSF, result.kbase)
++        assertEquals("Mali-G615 MC6", result.deviceName)
++    }
++
++    @Test fun aKirin9000sIsMaleoonWithNoMaliNode() {
++        val result = probe(
++            FakeEnv(
++                props = mapOf("ro.board.platform" to "kirin9000s", "ro.soc.model" to "Kirin 9000S"),
++                manufacturer = "HUAWEI",
++            )
++        )
++        assertEquals(GpuVendor.HUAWEI_MALEOON, result.vendor)
++        assertEquals("Maleoon 910", result.deviceName)
++        assertEquals("kirin9000s", result.kirin?.id)
++        assertTrue(result.isMaleoonKirin)
++        assertNull(result.kernelNode)
++    }
++
++    @Test fun maleoonIsAlsoRecognisedFromTheGpusOwnName() {
++        // No SoC table hit, no Huawei library path: the GPU still names itself.
++        val result = probe(FakeEnv(vulkanDeviceName = "Maleoon 910"))
++        assertEquals(GpuVendor.HUAWEI_MALEOON, result.vendor)
++        assertEquals("Maleoon 910", result.deviceName)
++    }
++
++    @Test fun maleoonLibrariesAreEnoughWithoutAName() {
++        val result = probe(FakeEnv(files = setOf(DriverPaths.MALEOON_VULKAN)))
++        assertEquals(GpuVendor.HUAWEI_MALEOON, result.vendor)
++        assertEquals(DriverPaths.MALEOON_VULKAN, result.driverLib)
++    }
++
++    @Test fun otherVendorsAreNamedRatherThanCalledUnknown() {
++        assertEquals(GpuVendor.SAMSUNG_XCLIPSE, probe(FakeEnv(vulkanDeviceName = "Samsung Xclipse 920")).vendor)
++        assertEquals(GpuVendor.IMAGINATION, probe(FakeEnv(vulkanDeviceName = "PowerVR D-Series DXT-48")).vendor)
++    }
++
++    @Test fun anEmptyDeviceIsUnknownAndSaysSo() {
++        val result = probe(FakeEnv(hardware = "qcom"))
++        assertEquals(GpuVendor.UNKNOWN, result.vendor)
++        assertEquals("qcom", result.deviceName)
++        assertEquals(KbaseInterface.NONE, result.kbase)
++    }
++
++    @Test fun maliNamesAreReadFromWhatTheGpuReports() {
++        assertEquals("Mali-G78", GpuProbe.maliName("Mali-G78 r0p1"))
++        assertEquals("Mali-G615 MC6", GpuProbe.maliName("Mali-G615 MC6"))
++        assertEquals("Immortalis-G720 MC12", GpuProbe.maliName("Immortalis-G720 MC12"))
++        assertNull(GpuProbe.maliName("Adreno (TM) 740"))
++        assertNull(GpuProbe.maliName(""))
++    }
++
++    @Test fun maleoonNamesAreReadFromWhatTheGpuReports() {
++        assertEquals("Maleoon 910", GpuProbe.maleoonName("Maleoon 910"))
++        assertEquals("Maleoon 920", GpuProbe.maleoonName("Maleoon920"))
++        assertNull(GpuProbe.maleoonName("Mali-G78"))
++    }
++
++    @Test fun theAdrenoNumberRuleIsUnchanged() {
++        // The same rule the Adreno probe has always used, including refusing Mali's numbers.
++        assertEquals(0, GpuProbe.threeDigits("Mali-G850"))
++        assertEquals(0, GpuProbe.threeDigits("Maleoon 910"))
++        assertEquals(740, GpuProbe.threeDigits("Adreno740v2"))
++    }
++}
+diff --git a/app/src/test/java/com/droiddeck/launcher/gpu/probe/HarmonyOsTest.kt b/app/src/test/java/com/droiddeck/launcher/gpu/probe/HarmonyOsTest.kt
+new file mode 100644
+index 0000000..a8a9c80
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/gpu/probe/HarmonyOsTest.kt
+@@ -0,0 +1,63 @@
++package com.droiddeck.launcher.gpu.probe
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * The target device runs HarmonyOS 4.x, which is Android 12 under the hood (API 31/32) and installs
++ * this app. What the detection has to get right is the version wording, because "EMUI 14" and
++ * "HarmonyOS 4" are the same release and users know the second one.
++ */
++class HarmonyOsTest {
++
++    private fun huawei(props: Map<String, String>, sdk: Int = 31) =
++        HarmonyOs.detect(FakeEnv(props = props, manufacturer = "HUAWEI", sdkInt = sdk))
++
++    @Test fun harmonyOs4IsDetectedAndIsSessionCapable() {
++        val os = huawei(mapOf("hw_sc.build.platform.version" to "4.2.0"))
++        assertTrue(os.detected)
++        assertEquals("4.2.0", os.version)
++        assertEquals(31, os.apiLevel)
++        assertTrue(os.sessionCapable)
++        assertEquals("HarmonyOS 4.2.0 (Android API 31)", os.label())
++    }
++
++    @Test fun emuiIsTheSameReleaseNumberedTenHigher() {
++        // EMUI 12/13/14 are HarmonyOS 2/3/4. Reporting "14.0.0" to a user would be wrong.
++        assertEquals("4.0.0", HarmonyOs.fromEmui("EmotionUI_14.0.0"))
++        assertEquals("3.1.0", HarmonyOs.fromEmui("EmotionUI_13.1.0"))
++        assertEquals("2.0.0", HarmonyOs.fromEmui("EmotionUI_12.0.0"))
++        // Already HarmonyOS-numbered: left alone.
++        assertEquals("4.2.0", HarmonyOs.fromEmui("4.2.0"))
++        assertEquals("", HarmonyOs.fromEmui(""))
++        assertEquals("", HarmonyOs.fromEmui("EmotionUI"))
++    }
++
++    @Test fun anEmuiOnlyBuildStillReportsAHarmonyVersion() {
++        val os = huawei(mapOf("ro.build.version.emui" to "EmotionUI_14.0.0"))
++        assertEquals("4.0.0", os.version)
++        assertEquals("HarmonyOS 4.0.0 (Android API 31)", os.label())
++    }
++
++    @Test fun aKirinPlatformIsEnoughEvenWithoutTheManufacturerProp() {
++        val os = HarmonyOs.detect(FakeEnv(props = mapOf("ro.board.platform" to "kirin9010"), sdkInt = 31))
++        assertTrue(os.detected)
++    }
++
++    @Test fun aNonHuaweiDeviceIsNotCalledHarmonyOs() {
++        val os = HarmonyOs.detect(
++            FakeEnv(props = mapOf("ro.board.platform" to "kalama"), manufacturer = "Google", sdkInt = 34)
++        )
++        assertFalse(os.detected)
++        assertEquals("", os.label())
++    }
++
++    @Test fun theVersionIsBlankRatherThanInventedWhenTheBuildSaysNothing() {
++        val os = huawei(emptyMap())
++        assertTrue(os.detected)
++        assertEquals("", os.version)
++        assertEquals("HarmonyOS (Android API 31)", os.label())
++    }
++}
+diff --git a/app/src/test/java/com/droiddeck/launcher/gpu/probe/Kirin9010RealDeviceTest.kt b/app/src/test/java/com/droiddeck/launcher/gpu/probe/Kirin9010RealDeviceTest.kt
+new file mode 100644
+index 0000000..a03c226
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/gpu/probe/Kirin9010RealDeviceTest.kt
+@@ -0,0 +1,144 @@
++package com.droiddeck.launcher.gpu.probe
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * A recording of a real device, replayed.
++ *
++ * Captured from a **Kirin 9010 handset on HarmonyOS (Android 12, API 31)** with `probe-device.sh`.
++ * Every value below was read off real hardware, not invented, and the
++ * point of the file is that it disagrees with two things the design assumed before hardware arrived:
++ *
++ *  1. The Maleoon Vulkan driver is `/vendor/lib64/hw/vulkan.hvgr_v200.so` - `hvgr`, not `maleoon`.
++ *  2. `ro.soc.model` is just `"Kirin"`; the model number lives in `ro.board.platform` (`Kirin9010`).
++ *
++ * It also records what the device does *not* have: no `/dev/mali0`, no `/sys/class/misc/mali0`, no
++ * `/dev/dri`, no `/sys/class/kgsl`. Those absences are what make "software rendering only" a fact
++ * about this phone rather than an assumption about the vendor.
++ */
++class Kirin9010RealDeviceTest {
++
++    /** The device as it described itself. */
++    private fun pura70() = FakeEnv(
++        files = setOf("/vendor/lib64/hw/vulkan.hvgr_v200.so"),
++        props = mapOf(
++            "ro.board.platform" to "Kirin9010",
++            "ro.soc.model" to "Kirin",
++            "ro.soc.manufacturer" to "Hisilicon",
++            "ro.hardware" to "Kirin9010",
++            "hw_sc.build.platform.version" to "4.2.0",
++            "ro.build.version.emui" to "EmotionUI_14.2.0",
++        ),
++        sdkInt = 31,
++        hardware = "Kirin9010",
++        manufacturer = "HUAWEI",
++        vulkanDeviceName = "Maleoon 910",
++    )
++
++    @Test fun thePhoneIsIdentifiedAsAMaleoonKirin() {
++        val probe = GpuProbe.probe(pura70())
++        assertEquals(GpuVendor.HUAWEI_MALEOON, probe.vendor)
++        assertEquals("Maleoon 910", probe.deviceName)
++        assertEquals("kirin9010", probe.kirin?.id)
++        assertEquals(KirinSoc.Era.MALEOON, probe.kirin?.era)
++        assertTrue(probe.isMaleoonKirin)
++    }
++
++    @Test fun theGpuIsReachedThroughNoKernelNodeAtAll() {
++        // This is the fact that decides the whole support story: there is no kbase and no DRM node.
++        val probe = GpuProbe.probe(pura70())
++        assertNull(probe.kernelNode)
++        assertEquals(KbaseInterface.NONE, probe.kbase)
++    }
++
++    @Test fun theDriverIsFoundUnderItsRealNameNotTheMarketingOne() {
++        val probe = GpuProbe.probe(pura70())
++        assertEquals("/vendor/lib64/hw/vulkan.hvgr_v200.so", probe.driverLib)
++    }
++
++    @Test fun hvgrIsClassifiedAsHuawei() {
++        assertEquals(GpuVendor.HUAWEI_MALEOON, GpuProbe.vendorOfDriverFile("vulkan.hvgr_v200.so"))
++        assertEquals(GpuVendor.HUAWEI_MALEOON, GpuProbe.vendorOfDriverFile("vulkan.maleoon.so"))
++        assertEquals(GpuVendor.ARM_MALI, GpuProbe.vendorOfDriverFile("vulkan.mali.so"))
++        assertEquals(GpuVendor.QUALCOMM, GpuProbe.vendorOfDriverFile("vulkan.adreno.so"))
++        // Not a Vulkan HAL driver: must not be attributed to anyone.
++        assertNull(GpuProbe.vendorOfDriverFile("libGLES_mali.so"))
++        assertNull(GpuProbe.vendorOfDriverFile("vulkan.hvgr_v200.txt"))
++    }
++
++    @Test fun theSocModelPropertyAloneWouldNotHaveNamedTheChip() {
++        // ro.soc.model is "Kirin" on this build, so the model has to come from ro.board.platform.
++        assertNull(KirinCatalog.identify("Kirin"))
++        assertEquals("kirin9010", KirinCatalog.identify("Kirin9010")?.id)
++    }
++
++    @Test fun theDriverDirectoryListingFindsItEvenWithNoKnownPathMatch() {
++        // A driver name no version of this code has seen: only the directory listing can find it.
++        val env = FakeEnv(
++            files = setOf("/vendor/lib64/hw/vulkan.hvgr_v210.so"),
++            vulkanDeviceName = "",
++            hardware = "unknown",
++        )
++        val probe = GpuProbe.probe(env)
++        assertEquals(GpuVendor.HUAWEI_MALEOON, probe.vendor)
++        assertEquals("/vendor/lib64/hw/vulkan.hvgr_v210.so", probe.driverLib)
++    }
++
++    @Test fun theGlRendererStringTheDeviceActuallyPrintsIsParsed() {
++        // dumpsys SurfaceFlinger: "GLES: HUAWEI, Maleoon 910, OpenGL ES 3.2 B236.95f3eca3..."
++        assertEquals(
++            "Maleoon 910",
++            GpuProbe.maleoonName("HUAWEI, Maleoon 910, OpenGL ES 3.2 B236.95f3eca3c57559aa9ed21461acd7e5da485113ec"),
++        )
++    }
++
++    @Test fun theDefaultPolicyKeepsThisGpuOutOfTheGuest() {
++        val decision = BackendRegistry.select(GpuProbe.probe(pura70()), GpuPolicy.AUTO)
++        assertEquals("lavapipe", decision.chosen.backendId)
++        assertFalse(decision.chosen.gpuInGuest)
++        assertTrue(decision.chosen.binds.isEmpty())
++    }
++
++    @Test fun askingForHardwareCannotBeGrantedAndSaysSo() {
++        val decision = BackendRegistry.select(GpuProbe.probe(pura70()), GpuPolicy.PREFER_HARDWARE)
++        assertEquals("lavapipe", decision.chosen.backendId)
++        val bridge = decision.candidates.first { it.backendId == "vendor-bridge" }
++        assertEquals(Risk.BLOCKED, bridge.risk)
++        assertTrue(bridge.reason.contains("bionic"))
++    }
++
++    @Test fun theTuningMatchesThePhoneItWasWrittenFor() {
++        // 8 cores on this device (4x2.3 + 3x2.18 + 1x1.55 per the captured /proc/cpuinfo shape).
++        val tuning = DeviceProfiles.forProbe(GpuProbe.probe(pura70()), cpuCores = 8)!!
++        assertEquals("Kirin 9010 (software)", tuning.label)
++        assertEquals(60, tuning.resolutionScalePercent)
++        assertEquals("6", tuning.env["LP_NUM_THREADS"])
++    }
++
++    @Test fun harmonyOs4Point2IsReadFromThePlatformProperty() {
++        val os = HarmonyOs.detect(pura70())
++        assertTrue(os.detected)
++        assertEquals("4.2.0", os.version)
++        assertEquals(31, os.apiLevel)
++        assertTrue(os.sessionCapable)
++    }
++
++    @Test fun aMaliEraKirinWithTheSamePropertiesShapeStillReadsAsMali() {
++        // The same detection code against a Kirin 9000: kbase node present, so it is Mali, not Maleoon.
++        val env = FakeEnv(
++            files = setOf("/dev/mali0"),
++            props = mapOf("ro.board.platform" to "Kirin9000", "ro.soc.model" to "Kirin"),
++            sdkInt = 29,
++            hardware = "Kirin9000",
++            manufacturer = "HUAWEI",
++        )
++        val probe = GpuProbe.probe(env)
++        assertEquals(GpuVendor.ARM_MALI, probe.vendor)
++        assertEquals("kirin9000", probe.kirin?.id)
++        assertEquals(KbaseInterface.JM, probe.kbase)
++    }
++}
+diff --git a/app/src/test/java/com/droiddeck/launcher/gpu/probe/KirinCatalogTest.kt b/app/src/test/java/com/droiddeck/launcher/gpu/probe/KirinCatalogTest.kt
+new file mode 100644
+index 0000000..919dfcd
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/gpu/probe/KirinCatalogTest.kt
+@@ -0,0 +1,77 @@
++package com.droiddeck.launcher.gpu.probe
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class KirinCatalogTest {
++
++    @Test fun theSameNameCoversTwoDifferentGpuStacks() {
++        // The whole reason the catalog carries an era: these two are one generation apart in
++        // marketing and nothing alike underneath.
++        val nineThousand = KirinCatalog.identify("kirin9000")!!
++        assertEquals(KirinSoc.Era.MALI, nineThousand.era)
++        assertEquals(GpuVendor.ARM_MALI, nineThousand.vendor)
++        assertEquals(KbaseInterface.JM, nineThousand.kbase)
++        assertTrue(nineThousand.hasOpenGuestDriver)
++
++        val nineThousandS = KirinCatalog.identify("kirin9000s")!!
++        assertEquals(KirinSoc.Era.MALEOON, nineThousandS.era)
++        assertEquals(GpuVendor.HUAWEI_MALEOON, nineThousandS.vendor)
++        assertEquals("Maleoon 910", nineThousandS.gpu)
++        assertTrue(!nineThousandS.hasOpenGuestDriver)
++    }
++
++    @Test fun aMoreSpecificIdBeatsItsOwnPrefix() {
++        // "kirin9000s" contains "kirin9000"; reading it as the older part would pick the wrong GPU
++        // and, with it, a driver that cannot work.
++        assertEquals("kirin9000s", KirinCatalog.identify("kirin9000s")!!.id)
++        assertEquals("kirin9000", KirinCatalog.identify("kirin9000")!!.id)
++        assertEquals("kirin9000s", KirinCatalog.identify("kirin9000", "kirin9000s")!!.id)
++        assertEquals("kirin9000e", KirinCatalog.identify("Kirin 9000E")!!.id)
++    }
++
++    @Test fun huaweiSpellsTheSameChipSeveralWays() {
++        // ro.board.platform, Build.HARDWARE and the marketing string all disagree in the wild.
++        for (text in listOf("kirin9000", "KIRIN9000", "Kirin 9000", " kirin-9000 ", "hisilicon kirin9000")) {
++            assertEquals(text, "kirin9000", KirinCatalog.identify(text)?.id)
++        }
++        assertEquals("kirin9000s", KirinCatalog.identify("Kirin 9000S")?.id)
++        assertEquals("kirin9020", KirinCatalog.identify("kirin 9020")?.id)
++    }
++
++    @Test fun olderPartsAreNamedByTheirHiNumbers() {
++        assertEquals("kirin960", KirinCatalog.identify("hi3660")?.id)
++        assertEquals("kirin970", KirinCatalog.identify("hi3670")?.id)
++        assertEquals("kirin980", KirinCatalog.identify("hi3680")?.id)
++        // And an hi number with no catalog entry stays unknown rather than being guessed.
++        assertNull(KirinCatalog.identify("hi9999"))
++    }
++
++    @Test fun everyMaliEraPartIsJobManagerUntilTheValhallV10Split() {
++        // Kirin 9000 and older: licensed Mali on Job Manager. A CSF-only build cannot drive these.
++        for (id in listOf("kirin970", "kirin980", "kirin985", "kirin990", "kirin9000", "kirin9000e", "kirin820")) {
++            val soc = KirinCatalog.byId(id)!!
++            assertEquals(id, KbaseInterface.JM, soc.kbase)
++            assertEquals(id, GpuVendor.ARM_MALI, soc.vendor)
++        }
++    }
++
++    @Test fun aNonKirinDeviceIsNotForcedIntoTheCatalog() {
++        assertNull(KirinCatalog.identify("kalama"))
++        assertNull(KirinCatalog.identify("SM8650"))
++        assertNull(KirinCatalog.identify(""))
++        assertNull(KirinCatalog.identify(null))
++        assertNull(KirinCatalog.identify("exynos2400"))
++    }
++
++    @Test fun tokensAreNormalisedNotSubstringMatched() {
++        // "kirin" without a number, and numbers without "kirin", must not match.
++        assertTrue(KirinCatalog.split("kirin").isEmpty())
++        assertTrue(KirinCatalog.split("9000").isEmpty())
++        assertEquals(listOf("kirin9000"), KirinCatalog.split("Kirin-9000"))
++        // A five-digit run is not a Kirin model.
++        assertTrue(KirinCatalog.split("kirin90000").isEmpty())
++    }
++}
+diff --git a/app/src/test/java/com/droiddeck/launcher/gpu/probe/SessionGpuPlanTest.kt b/app/src/test/java/com/droiddeck/launcher/gpu/probe/SessionGpuPlanTest.kt
+new file mode 100644
+index 0000000..f9a3f3d
+--- /dev/null
++++ b/app/src/test/java/com/droiddeck/launcher/gpu/probe/SessionGpuPlanTest.kt
+@@ -0,0 +1,167 @@
++package com.droiddeck.launcher.gpu.probe
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * The mapping from a backend decision to what the session actually does.
++ *
++ * The first thing asserted is that Adreno is untouched: this layer exists to add vendors, not to
++ * move the path the project has shipped for a year.
++ */
++class SessionGpuPlanTest {
++
++    private val adreno = GpuProbe.probe(
++        FakeEnv(files = setOf(DriverPaths.KGSL), contents = mapOf("/sys/class/kgsl/kgsl-3d0/gpu_model" to "Adreno740"))
++    )
++
++    /** A Kirin 9010 handset, as recorded from hardware. */
++    private val kirin9010 = GpuProbe.probe(
++        FakeEnv(
++            files = setOf("/vendor/lib64/hw/vulkan.hvgr_v200.so"),
++            props = mapOf("ro.board.platform" to "Kirin9010"),
++            sdkInt = 31,
++            hardware = "Kirin9010",
++            manufacturer = "HUAWEI",
++            vulkanDeviceName = "Maleoon 910",
++        )
++    )
++
++    private val maliCsf = GpuProbe.probe(
++        FakeEnv(
++            files = setOf(DriverPaths.MALI_DEV, DriverPaths.MALI_CSF),
++            contents = mapOf(DriverPaths.MALI_CSF to "1"),
++            vulkanDeviceName = "Mali-G615 MC6",
++        )
++    )
++
++    private fun plan(probe: GpuProbeResult, policy: GpuPolicy, icd: String? = "/opt/lvp/lvp_icd.json") =
++        SessionGpu.plan(
++            BackendRegistry.select(probe, policy),
++            icd,
++            DeviceProfiles.forProbe(probe, cpuCores = 8),
++        )
++
++    @Test fun adrenoKeepsWritingItsOwnEnvironment() {
++        // keepAdrenoDefaults means SessionService emits exactly the three lines it always has.
++        val plan = plan(adreno, GpuPolicy.AUTO)
++        assertTrue(plan.keepAdrenoDefaults)
++        assertFalse(plan.software)
++        assertTrue(plan.env.isEmpty())
++        assertNull(plan.icdPath)
++        assertEquals(100, plan.resolutionScalePercent)
++        assertEquals(0, plan.maxRefreshHz)
++        assertFalse(plan.missingSoftwareDriver)
++    }
++
++    @Test fun aKirin9010BecomesACpuSessionWithItsProfile() {
++        val plan = plan(kirin9010, GpuPolicy.AUTO)
++        assertTrue(plan.software)
++        assertFalse(plan.keepAdrenoDefaults)
++        assertEquals("/opt/lvp/lvp_icd.json", plan.icdPath)
++        // The loader finds lavapipe's LLVM and shims only if the pack's directory is named.
++        assertEquals("/opt/lvp", plan.libraryDir)
++        assertEquals(60, plan.resolutionScalePercent)
++        assertEquals(60, plan.maxRefreshHz)
++        // The lavapipe backend's own environment, plus the device profile's threading.
++        assertEquals("1", plan.env["LIBGL_ALWAYS_SOFTWARE"])
++        assertEquals("llvmpipe", plan.env["MESA_LOADER_DRIVER_OVERRIDE"])
++        assertEquals("6", plan.env["LP_NUM_THREADS"])
++        assertEquals("/var/cache/droiddeck/mesa", plan.env["MESA_SHADER_CACHE_DIR"])
++    }
++
++    @Test fun aCpuSessionWithNoImportedDriverSaysSo() {
++        // Without a CPU Vulkan driver the guest has no Vulkan device at all. The plan must not
++        // pretend otherwise - the session log has to carry the reason.
++        val plan = plan(kirin9010, GpuPolicy.AUTO, icd = null)
++        assertTrue(plan.software)
++        assertTrue(plan.missingSoftwareDriver)
++        assertNull(plan.icdPath)
++    }
++
++    @Test fun forcingSoftwareOnAdrenoDropsTheAdrenoEnvironment() {
++        // zink/kopper point at the GPU; a forced-software session must not ask for them.
++        val plan = plan(adreno, GpuPolicy.FORCE_SOFTWARE)
++        assertTrue(plan.software)
++        assertFalse(plan.keepAdrenoDefaults)
++        assertEquals("llvmpipe", plan.env["MESA_LOADER_DRIVER_OVERRIDE"])
++        // No device profile for Adreno, so nothing is scaled.
++        assertEquals(100, plan.resolutionScalePercent)
++    }
++
++    @Test fun aMaliGpuSessionBringsItsOwnEnvironmentAndIsNotScaled() {
++        val plan = plan(maliCsf, GpuPolicy.PREFER_HARDWARE)
++        assertFalse(plan.software)
++        assertFalse(plan.keepAdrenoDefaults)
++        assertEquals("mali", plan.env["BL_GPU_FAMILY"])
++        assertNull(plan.icdPath)
++        assertEquals(100, plan.resolutionScalePercent)
++    }
++
++    @Test fun softwareDriversAreRecognisedByAnyNameTheirAuthorChose() {
++        for (name in listOf("lavapipe", "mesa-lavapipe-24.1.0", "lvp", "LVP-icd", "llvmpipe", "swrast", "softpipe")) {
++            assertTrue(name, SessionGpu.isSoftwareDriverName(name))
++        }
++        for (name in listOf("turnip", "mesa-turnip-25.1.0", "lvpx", "adreno", "", null)) {
++            assertFalse("$name", SessionGpu.isSoftwareDriverName(name))
++        }
++    }
++
++    @Test fun aGpuSessionNamesNoLibraryDirectory() {
++        assertNull(plan(adreno, GpuPolicy.AUTO).libraryDir)
++    }
++
++    @Test fun theDriverPickedOnTheComponentsScreenWins() {
++        // Two lavapipe packs installed side by side: alphabetical order must not decide.
++        val installed = listOf("lavapipe_Mesa_20.3_", "lavapipe_Mesa_26.2_")
++        val names = mapOf("lavapipe_Mesa_20.3_" to "lavapipe (Mesa 20.3)", "lavapipe_Mesa_26.2_" to "lavapipe (Mesa 26.2)")
++        assertEquals(
++            "lavapipe_Mesa_26.2_",
++            SessionGpu.pickSoftwareDriver(installed, "lavapipe_Mesa_26.2_") { names[it].orEmpty() },
++        )
++        assertEquals(
++            "lavapipe_Mesa_20.3_",
++            SessionGpu.pickSoftwareDriver(installed, "lavapipe_Mesa_20.3_") { names[it].orEmpty() },
++        )
++    }
++
++    @Test fun aChosenDriverThatIsNotACpuRendererIsNotUsedForSoftware() {
++        // Someone selected a Turnip pack; a software session must not load it.
++        val installed = listOf("mesa-turnip-25.1.0", "lavapipe_Mesa_26.2_")
++        val names = mapOf("mesa-turnip-25.1.0" to "Turnip 25.1.0", "lavapipe_Mesa_26.2_" to "lavapipe (Mesa 26.2)")
++        assertEquals(
++            "lavapipe_Mesa_26.2_",
++            SessionGpu.pickSoftwareDriver(installed, "mesa-turnip-25.1.0") { names[it].orEmpty() },
++        )
++    }
++
++    @Test fun withNoChoiceTheFirstCpuRendererIsUsed() {
++        val installed = listOf("mesa-turnip-25.1.0", "lavapipe_Mesa_26.2_")
++        val names = mapOf("mesa-turnip-25.1.0" to "Turnip 25.1.0", "lavapipe_Mesa_26.2_" to "lavapipe (Mesa 26.2)")
++        assertEquals("lavapipe_Mesa_26.2_", SessionGpu.pickSoftwareDriver(installed, "") { names[it].orEmpty() })
++        assertNull(SessionGpu.pickSoftwareDriver(listOf("mesa-turnip-25.1.0"), "") { "Turnip 25.1.0" })
++    }
++
++    @Test fun theRenderScaleStaysEvenAndNeverCollapses() {
++        // A Kirin 9010 panel: 2844x1260 landscape.
++        assertEquals(1706, SessionGpu.scaledOutput(2844, 60))
++        assertEquals(756, SessionGpu.scaledOutput(1260, 60))
++        // Odd results are rounded down to an even number, so no half-pixel seam survives.
++        assertEquals(1420, SessionGpu.scaledOutput(2843, 50))
++        // Unscaled stays exactly as it was.
++        assertEquals(2844, SessionGpu.scaledOutput(2844, 100))
++        // A tiny scale cannot produce a size gamescope refuses.
++        assertEquals(320, SessionGpu.scaledOutput(1000, 10))
++    }
++
++    @Test fun theLogLineSaysWhichPathDrewTheFrame() {
++        val text = SessionGpu.describe(plan(kirin9010, GpuPolicy.AUTO))
++        assertTrue(text.contains("lavapipe"))
++        assertTrue(text.contains("software"))
++        assertTrue(text.contains("60%"))
++        assertTrue(text.contains("60 Hz"))
++    }
++}
+diff --git a/docs/architecture/gpu-backend-architecture.md b/docs/architecture/gpu-backend-architecture.md
+new file mode 100644
+index 0000000..90daee4
+--- /dev/null
++++ b/docs/architecture/gpu-backend-architecture.md
+@@ -0,0 +1,271 @@
++# DroidDeck GPU 后端架构设计
++
++> 目标读者：后续维护 DroidDeck 的工程师
++> 状态：已落地（`app/src/main/java/com/droiddeck/launcher/gpu/probe/`）
++> 关联：[麒麟支持路线图](kirin-roadmap.md)
++
++---
++
++## 1. 问题：一个等价关系被当成了架构
++
++上游把两个问题合并成了一个：
++
++```
++"这台设备是 Adreno 吗？"  ==  "这台设备能跑 Linux 会话吗？"
++```
++
++在只有高通设备的年代这个等价关系是成立的，于是它被写进了四个地方：
++
++| 位置 | 形式 |
++|---|---|
++| `core/DeviceSupport.adreno()` | 两个路径的 `File.exists()` |
++| `gpu/GpuInfo.Family.NOT_ADRENO` | 非 Adreno 一律 `Support.UNSUPPORTED` |
++| `runtime/LinuxRuntime.vulkanIcd()` | 优先找 `freedreno`（Turnip）的 ICD |
++| `FrontEndActivity:2434` | 非 Adreno 直接弹"不支持"卡片并 return |
++
++要支持第二、第三个 GPU 厂商，必须先把这个等价关系拆开。**加 `if` 不行**：每来一颗芯片就多一个分支，分支之间互相不知道对方存在，而"某型号能跑"会被误读成"这个厂商能跑"。
++
++---
++
++## 2. 约束（来自实机与社区证据）
++
++这些不是假设，是必须尊重的硬约束：
++
++1. **Turnip 只驱动 Adreno**。它是 Mesa 的 freedreno Vulkan 驱动，与 Mali/Maleoon 无关。
++2. **Maleoon 没有开源驱动**。华为 Vulkan 驱动是 bionic 链接的闭源 blob，在 glibc 的 proot 容器里 `dlopen` 失败。麒麟 9000S / 9010 / 9020 属于这一类。
++3. **kbase 分 CSF 与 JM 两代**。Mali-G615 是 CSF，Mali-G78（麒麟 9000）是 JM。CSF 专用构建驱动 JM 必然失败。
++4. **GPU 驱动崩溃的代价不是"卡"，是整机重启**。社区 fork 的审计文档记录了一次实际发生的冻结+重启，且没有留下 last_kmsg。
++5. **不可审计的二进制不可默认分发**。fork 的 21.5 MB 后端无源码，且其自证材料对应的 hash 与实际发布的不是同一个。
++
++---
++
++## 3. 设计目标
++
++| 目标 | 验收方式 |
++|---|---|
++| Adreno 行为零变化 | 既有 `GpuDetectionTest` 全部通过；`familyOf(adreno, model)` 签名不变 |
++| 新增 GPU 厂商只加一个类 | 新后端实现 `RenderBackend`，注册进 `BackendRegistry.backends` |
++| 检测与选择可在无真机时验证 | 全部走 `ProbeEnv`，测试用 `FakeEnv` 描述设备 |
++| 默认永不把未验证的 GPU 交给 guest | `GpuPolicy.AUTO` 只选 `Risk.SAFE` |
++| 失败必须可解释 | `BackendPlan.reason` 是必填字段 |
++
++---
++
++## 4. 分层
++
++```
++┌─────────────────────────────────────────────────────────────┐
++│ 表现层  FrontEndActivity / DriverMenus / DeviceReport        │
++│         只问"用什么后端、风险是什么"，不判断厂商              │
++├─────────────────────────────────────────────────────────────┤
++│ 门面    GpuBackends.probe() / decide(context) / policy()     │
++├─────────────────────────────────────────────────────────────┤
++│ 策略    BackendRegistry.select(probe, policy)                │
++│         偏好序 + 风险排序，纯函数                             │
++├─────────────────────────────────────────────────────────────┤
++│ 契约    RenderBackend  ──>  BackendPlan                      │
++│         Turnip │ PanVK-kbase │ lavapipe │ vendor-bridge      │
++├─────────────────────────────────────────────────────────────┤
++│ 事实    GpuProbe.probe(env)  ──>  GpuProbeResult             │
++│         KirinCatalog / DeviceProfiles                        │
++├─────────────────────────────────────────────────────────────┤
++│ 环境    ProbeEnv（文件 / 属性 / API / 厂商 / Vulkan 设备名）  │
++│         AndroidProbeEnv（真机） │ FakeEnv（测试）             │
++└─────────────────────────────────────────────────────────────┘
++```
++
++**依赖方向严格向下**：`RenderBackend` 不认识 Android，`GpuProbe` 不认识策略，策略不认识 UI。所以整条链路能在 JVM 单测里跑。
++
++---
++
++## 5. 关键决策与权衡
++
++### 5.1 风险三档，而不是"支持/不支持"
++
++```kotlin
++enum class Risk { SAFE, EXPERIMENTAL, BLOCKED }
++```
++
++- `SAFE`：已在目标硬件上验证过的路径（Adreno+Turnip、lavapipe）。
++- `EXPERIMENTAL`：可能能跑，但需要用户显式导入驱动并承担风险（Mali CSF + PanVK）。
++- `BLOCKED`：**不是"没试过"，是"不可能"**（Maleoon 硬件加速、Mali JM 上的公开 PanVK 构建）。
++
++> 权衡：为什么不用布尔值 `supported`？因为布尔值无法表达"现在不行但将来行"，而 Maleoon 恰恰需要这个状态——它必须能被用户看到（"你的 GPU 我们认识，但暂时没有驱动"），而不是被折叠进"未知设备"。
++
++### 5.2 默认策略只允许 SAFE
++
++```kotlin
++GpuPolicy.AUTO -> usable.firstOrNull { it.risk == Risk.SAFE }
++```
++
++后果：Mali 和 Maleoon 默认都落到 **lavapipe（CPU）**。
++
++> 权衡：这意味着 Mali 设备默认**不用**它的 GPU，性能损失巨大。这是刻意的。理由来自约束 4：默认开启一个可能让手机重启的驱动，是不可接受的默认值。想要性能的用户在设置里显式选择 `PREFER_HARDWARE`。
++
++### 5.3 硬件请求不会被 CPU 后端"抢走"
++
++```kotlin
++GpuPolicy.PREFER_HARDWARE -> usable
++    .filter { it.driverRequirement != DriverRequirement.CPU_SOFTWARE }
++    .minByOrNull { rank(it.risk) }
++```
++
++> 权衡：如果按风险全局排序，SAFE 的 lavapipe 永远赢过 EXPERIMENTAL 的 PanVK，"请求硬件"就成了空操作。所以硬件策略先过滤掉 CPU 后端，再按风险排。
++
++### 5.4 CSF 与 JM 是两个判定，不是一个
++
++`PanVkKbaseBackend.evaluate()` 对 `KbaseInterface.CSF` 返回 `EXPERIMENTAL`，对 `JM` 返回 `BLOCKED`。
++
++> 权衡：JM 上标记 BLOCKED 会让麒麟 9000（Mate 40 等主力机型）只能软件渲染。这是当前事实——公开的 PanVK-kbase 构建都是 CSF 的。给一个装不上的驱动入口比不给更糟：用户会导入、会启动、会得到黑屏，然后无法判断是自己操作错了还是驱动不兼容。
++
++### 5.5 不把 `/dev/mali0` 伪装成 DRM 节点
++
++```kotlin
++binds = listOf("/dev/mali0:/dev/mali0")
++```
++
++> 权衡：社区 fork 把 `mali0` 映射成 `/dev/dri/renderD<minor>`，并伪造 `/sys/dev/char/.../drm` 树让 gamescope 和 MangoHud 相信有 DRM 主节点。代价是：任何打开 `renderD*` 的软件都会拿 DRM ioctl 去打 `mali_kbase`。虽然 type/magic 不同、大概率 `-ENOTTY`，但"大概率"不是对内核 `unlocked_ioctl` 分发的保证。本设计选择让 PanVK 自己打开 kbase 节点。
++
++### 5.6 探测用证据，不用品牌
++
++优先级：Adreno（kgsl 节点/驱动库，无歧义）→ Maleoon（GPU 自报名/华为驱动库/Maleoon 时代 SoC 且无 mali 节点）→ Mali（kbase 节点/ARM 驱动库）→ 其他厂商。
++
++> 权衡：为什么不先查 SoC 表？因为 `ro.board.platform` 在华为设备上极不统一（`kirin9000` / `hi3660` / 营销名混用），而 `/dev/mali0` 的存在是物理事实。SoC 表用于**补充**（型号、kbase 代次、调优画像），不用于**判定厂商**。
++
++---
++
++## 6. 契约
++
++### 6.1 `ProbeEnv`
++
++探测层唯一允许访问的东西。`AndroidProbeEnv` 读真机，`FakeEnv` 读测试里描述的设备。
++
++```kotlin
++interface ProbeEnv {
++    fun exists(path: String): Boolean
++    fun readText(path: String): String?
++    fun property(name: String): String
++    val sdkInt: Int
++    val hardware: String
++    val manufacturer: String
++    val vulkanDeviceName: String?
++}
++```
++
++### 6.2 `RenderBackend`
++
++```kotlin
++interface RenderBackend {
++    val id: String
++    fun evaluate(probe: GpuProbeResult): BackendPlan?   // null = 不是我的设备
++}
++```
++
++新增一个 GPU 厂商 = 实现这个接口 + 加进 `BackendRegistry.backends`。**不需要改任何既有代码**。
++
++### 6.3 `BackendPlan`
++
++| 字段 | 含义 |
++|---|---|
++| `risk` | 三档风险 |
++| `gpuInGuest` | 是否把 GPU 内核节点交给 guest |
++| `driverRequirement` | 需要什么驱动（runtime 自带 / 用户导入 / CPU / 无） |
++| `env` | guest 环境变量增量（ICD 路径由调用方组合） |
++| `dxvk` | 需要的 `dxvk.conf` 键值 |
++| `binds` | `src:dst` 绑定 |
++| `reason` | **必填**，一句话说明为什么，供 bug report 引用 |
++
++---
++
++## 7. 失败模式
++
++| 失败 | 表现 | 本设计的处理 |
++|---|---|---|
++| 未识别的 GPU | 黑屏 + 有声音 | 兜底到 lavapipe，`reason` 说明原因 |
++| 用户导入错代次的 PanVK | 启动即失败 | JM/CSF 判定 + `driverRequirement=IMPORTED_ICD` 提示 |
++| kbase 驱动 hang | 整机重启 | 默认不交 GPU；硬件路径需显式 opt-in |
++| 驱动列表与设备不符 | 装了跑不动 | `GpuInfo.vendor` 参与列表匹配，非 Adreno 不再走 Adreno 列表 |
++
++---
++
++## 8. 验证策略
++
++真机不可得（没有麒麟设备），所以验证靠两层：
++
++1. **JVM 单测**（`app/src/test/.../gpu/probe/`）：用 `FakeEnv` 描述设备，断言探测结果与后端选择。覆盖：Adreno 优先级、Kirin 9000/970/9010、CSF vs JM、Maleoon 三种识别路径、所有策略组合、CPU 后端永不绑 GPU 节点、`AUTO` 永不选 EXPERIMENTAL。
++2. **真机灰度**：`DeviceReport` 输出探测结果与所选后端，让用户回传。
++
++> 未覆盖：驱动本身能否真正初始化。这需要真机，见路线图第 2 阶段。
++
++---
++
++## 9. 扩展点（下一个厂商怎么接）
++
++以三星 Xclipse（RDNA）为例：
++
++1. `GpuProbe` 已能识别为 `SAMSUNG_XCLIPSE`。
++2. 新建 `backends/XclipseBackend.kt`，实现 `RenderBackend`，在 `evaluate()` 里返回 `EXPERIMENTAL` 或 `BLOCKED`。
++3. 加进 `BackendRegistry.backends`。
++4. 加单测。
++
++不动 `GpuInfo`、不动 `DeviceSupport`、不动 UI。
++
++---
++
++## 10. 真机校准：设计假设被推翻的两处
++
++**设备**：Kirin 9010，HarmonyOS，Android 12 (API 31)。
++
++设计完成后用 `probe-device.sh` 采集真机事实，结果修正了两条假设。这两条如果不改，检测会在真机上**直接失效**：
++
++| 假设 | 真机事实 | 后果 |
++|---|---|---|
++| Maleoon 驱动是 `/vendor/lib64/hw/vulkan.maleoon.so` | 实际是 **`vulkan.hvgr_v200.so`**（`hvgr` = Huawei GPU renderer） | 按名字硬编码 → 漏检 |
++| `ro.soc.model` 带型号 | 实际只是 **`"Kirin"`**；型号在 `ro.board.platform = Kirin9010` | 只读 soc.model → 拿不到型号 |
++
++**修正方式不是再加一个常量，而是改变探测策略**：`GpuProbe.driverLibs()` 枚举 `/vendor/lib64/hw/` 目录，按文件名模式归类厂商（`adreno` / `hvgr`|`maleoon` / `mali` / `xclipse` / `powervr`）。已知路径只作为快速通道。这样下一个把驱动改名成 `vulkan.foo_v3.so` 的厂商不会再次打穿。
++
++### 10.1 真机还确认了这些"缺失"
++
++| 探测项 | 9010 实测 | 意义 |
++|---|---|---|
++| `/dev/mali0` | **不存在** | 印证 Maleoon 不走 kbase，PanVK 无从下手 |
++| `/sys/class/misc/mali0` | **不存在** | 同上 |
++| `/dev/dri`（含 `card0`、`renderD128`） | **不存在** | 见下：**不是阻塞点** |
++| `/sys/class/kgsl/kgsl-3d0` | 不存在 | 非高通 |
++| `/sys/class/devfreq/gpufreq` | **存在** | GPU 负载可读，性能面板可用（不依赖 kbase） |
++
++### 10.1.1 `/dev/dri` 缺失为什么不阻塞
++
++一开始我据此判断"gamescope 需要 headless 后端"，**这个判断是错的**。读代码后确认：
++
++```
++guest（proot / glibc）                      host（Android app 进程）
++┌───────────────────────────┐              ┌──────────────────────────────┐
++│ gamescope --backend wayland│  wayland    │ compositor.c                 │
++│ lavapipe（CPU 渲染）        │ ──────────→ │  take_shm() → 上传 Vulkan 纹理│
++│ 产出 wl_shm 缓冲            │   socket    │  vk_present.c → Maleoon 910  │
++└───────────────────────────┘              └──────────────────────────────┘
++```
++
++- gamescope 的启动参数是 `--backend wayland --expose-wayland`，它是**嵌套**在合成器里，从不直接开 DRM 设备。
++- 宿主合成器 `take_shm()`（`compositor.c:715`）完整支持 `wl_shm`，并把像素 `vkp_image_upload_shm()` 上传为 Vulkan 纹理；它甚至统计 `g_stat_shm` / `g_stat_dmabuf` 两种来源。
++- 呈现走 `vk_present.c` 的 `vkCreateInstance`，跑在 app 进程里 —— 用的正是 Maleoon 的 `hvgr` 驱动（bionic，Android 侧）。
++
++所以软件渲染是通的：**GPU 负责显示，CPU 负责渲染**。代价是每帧多一次 CPU→GPU 上传（shm 路径无法零拷贝），这会影响帧率但不影响可用性。
++
++> 教训：`/dev/dri` 缺失是"guest 不需要它"，不是"没人能显示"。判断之前必须看 gamescope 的实际参数，而不是假设它直连 DRM。
++
++### 10.2 真机回放测试
++
++`Kirin9010RealDeviceTest`（12 个用例）把上述采集值原样喂给 `GpuProbe`，断言：
++
++- 识别为 `HUAWEI_MALEOON` / `Maleoon 910` / `kirin9010`
++- `kernelNode == null`、`kbase == NONE`
++- `driverLib == /vendor/lib64/hw/vulkan.hvgr_v200.so`
++- 默认策略选 `lavapipe` 且不绑任何 GPU 节点
++- 请求硬件时 `vendor-bridge` 为 `BLOCKED`，理由含 `bionic`
++- 调优为 60% / 60Hz / 6 线程
++
++这使"检测与选择"从"逻辑上正确"变成"对这台真机正确"，且可回归。
++
+diff --git a/docs/architecture/kirin-roadmap.md b/docs/architecture/kirin-roadmap.md
+new file mode 100644
+index 0000000..c60e3a1
+--- /dev/null
++++ b/docs/architecture/kirin-roadmap.md
+@@ -0,0 +1,160 @@
++# 麒麟支持路线图
++
++> 关联：[GPU 后端架构设计](gpu-backend-architecture.md)
++> 第一优先目标：**麒麟 9010**（Maleoon 910）
++
++---
++
++## 0. 先说清楚 9010 的现实
++
++麒麟 9010 的 GPU 是 **Maleoon 910**，华为自研。这意味着：
++
++| 问题 | 答案 |
++|---|---|
++| 有 Mesa 开源驱动吗？ | **没有**。Mesa 没有 Maleoon 后端，也不在计划内 |
++| 能用华为的 Vulkan 驱动吗？ | **不能**。它是 bionic 链接的闭源 blob，glibc 容器里 `dlopen` 失败 |
++| 能用 Turnip 吗？ | 不能，Turnip 是 Adreno 专用 |
++| 能用 PanVK 吗？ | 不能，PanVK 只认 ARM Mali 的 kbase |
++| 那能跑吗？ | **能，但只能用 CPU 渲染（lavapipe）** |
++
++所以"实配麒麟 9010"的第一阶段目标不是"GPU 加速"，而是：
++
++> **让 9010 上的会话稳定启动、界面可用、并且诚实地告诉用户为什么慢。**
++
++GPU 加速是第 3 阶段的事，且需要一个独立工程（host 侧 Vulkan 桥）。
++
++### 0.1 前置门槛：系统版本（已确认为 HarmonyOS 4.x）
++
++**目标设备运行 HarmonyOS 4.x**，这解决了最关键的可行性问题：
++
++| 系统 | 底层 | 能否安装 Android APK | 结论 |
++|---|---|---|---|
++| **HarmonyOS 4.x** | Android 12（API 31/32） | **能** | ✅ 本方案适用，且正好落在 9010 的 `minApi=31` 上 |
++| HarmonyOS NEXT 5.x | 不再包含 Android 兼容层 | 不能 | ❌ APK 装不上，需鸿蒙原生重写 |
++
++因为 4.x 有完整的 Android 运行时，`proot`、`gamescope`、`SurfaceControl` 这些依赖的 AOSP 行为都成立，本方案不需要为鸿蒙做额外适配。
++
++**但有一处必须处理**：华为的低内存杀手（lmkd）比 AOSP 激进得多。容器内所有进程若都是 `oom_score_adj=0`，一次内存尖峰会把**整个会话**杀掉，而不是杀掉那个游戏。社区 fork 的解法是给 Steam 的 `reaper` 进程树设 `oom_score_adj=200`，让 lmkd 只终止失控的游戏。这一点已写入 `DeviceProfiles` 的 9010 画像说明，阶段 1.4 接线时必须实现。
++
++**版本识别**：`HarmonyOs.detect()` 已实现。注意 EMUI 与 HarmonyOS 的版本号相差 10（EMUI 14 = HarmonyOS 4.0），只报 EMUI 号会让用户困惑，所以做了换算。
++
++### 0.2 目标真机实测档案
++
++已用 `probe-device.sh` 在 Kirin 9010 真机上采集：
++
++| 项 | 实测值 | 对方案的影响 |
++|---|---|---|
++| 系统 | HarmonyOS 4.2.0，Android 12，API 31 | ✅ 可装 APK，`minApi=31` 正好 |
++| SoC | `ro.board.platform=Kirin9010`，`ro.soc.model=Kirin`（无型号） | 型号必须从 `ro.board.platform` 取 |
++| GPU | `Maleoon 910`（GLES: `HUAWEI, Maleoon 910, OpenGL ES 3.2`） | 与目录表一致 |
++| Vulkan 驱动 | **`/vendor/lib64/hw/vulkan.hvgr_v200.so`** | 名字是 `hvgr` 不是 `maleoon` |
++| `/dev/mali0` | **不存在** | Maleoon 无 kbase，PanVK 不可用 |
++| `/dev/dri` | **不存在**（`card0`/`renderD128` 全无） | 不阻塞：gamescope 走 `--backend wayland` 嵌套，宿主用 Vulkan 呈现 |
++| 内核 | 5.10.43 aarch64，page 4096 | — |
++| CPU | 8 核 | 调优取 `8-2=6` 线程 |
++| 内存 | MemTotal ≈ 15.2 GiB | 足够跑 Steam + 软件渲染 |
++| 面板 | 1260×2844，540dpi，支持 120/90/60/30 Hz | 横屏 2844×1260，60% → 1706×756 |
++| GPU 负载节点 | `/sys/class/devfreq/gpufreq` 存在 | 性能面板可读，不依赖 kbase |
++| Phantom process 限制 | 未设置（`null`） | 需引导用户在开发者选项开启 |
++
++
++
++---
++
++## 阶段 1 — 麒麟 9010 软件渲染可用化（当前优先）
++
++**目标**：9010 设备能装、能起、能用桌面，且用户知道为什么游戏慢。
++
++| # | 工作项 | 交付物 | 验收 |
++|---|---|---|---|
++| 1.1 | 探测与识别 | `GpuProbe` + `KirinCatalog`（已落地，**已真机回放验证**） | 单测：9010 → Maleoon 910 → BLOCKED 硬件路径 |
++| 1.2 | 设备画像 | `DeviceProfiles`：60% 渲染缩放、60Hz 上限、关帧生成/超分、`LP_NUM_THREADS`（已落地） | 单测覆盖 9000S/9010/9020 |
++| 1.3 | lavapipe 驱动包 | 提供可导入的 lavapipe ICD zip（arm64），来源可复现 | 真机：`vulkaninfo` 列出 llvmpipe |
++| 1.4 | 会话接线 | `SessionService` 按 `BackendPlan` 注入 env、按 `SessionTuning` 改分辨率/刷新率；不绑任何 GPU 节点 | 真机：会话启动，guest 内无 `/dev/mali0`、无 `/dev/kgsl-3d0` |
++| 1.5 | 设置页 | "渲染后端：自动 / 优先硬件 / 仅软件"，默认自动 | UI 显示当前后端与 `reason` |
++| 1.6 | 设备报告 | `DeviceReport` 增加 Kirin 区块：SoC、GPU、kbase、所选后端、`reason` | 用户可回传，用于灰度 |
++| 1.7 | 前置检查 | phantom process 限制未设置时引导开启；lmkd `oom_score_adj` 处理 | 会话不被整容器杀掉 |
++
++> **原 1.4「无 DRM 节点的合成路径」已撤销**。真机确认 `/dev/dri` 不存在，但读代码后确认 gamescope 用 `--backend wayland` 嵌套运行，宿主合成器 `take_shm()` 支持 `wl_shm` 并用 Vulkan（Maleoon `hvgr`）呈现。软件渲染路径是通的，只是每帧多一次 CPU→GPU 上传。详见架构文档 §10.1.1。
++
++**风险门**：1.4 必须保证"软件模式下 guest 内不存在 `/dev/mali0`、`/dev/kgsl-3d0`、`/dev/dri`"。这是整个方案的安全底线。
++
++**预期性能（要提前告知用户）**：
++- 桌面模式（KDE Plasma）：可用
++- Steam Big Picture：可用但明显掉帧
++- 3D 游戏：基本不可玩
++
++---
++
++## 阶段 2 — Mali 时代麒麟的硬件加速（9000 / 990 / 980 / 970）
++
++**目标**：让 Mali 设备用上 GPU，且不重蹈社区 fork 的覆辙（无源码 blob + 整机重启）。
++
++| # | 工作项 | 说明 |
++|---|---|---|
++| 2.1 | 可复现构建 | 从可读源码在 CI 构建 PanVK-kbase，产物附 `SOURCE.json` + 构建脚本 + sha256 |
++| 2.2 | JM 后端 | 当前公开构建都是 CSF；JM（G78/G76/G72）需要自行构建，这是 9000 能否加速的关键 |
++| 2.3 | 驱动包签名与来源 | 导入时校验来源与 hash，拒绝无来源的二进制 |
++| 2.4 | 崩溃取证 | 要求设备保留 `last_kmsg`；无法取证则不开放 |
++| 2.5 | 灰度开关 | 按 SoC 白名单逐步放开，默认仍为软件 |
++
++**风险门**：没有 CI 可复现构建 + 没有崩溃取证，**不进入默认路径**。
++
++**为什么 9000 值得做**：Mali-G78 MP24 是麒麟里 GPU 最强的一代（Vulkan 1.1），且存量设备（Mate 40 系列）多。它是"能真正玩游戏"的麒麟。
++
++---
++
++## 阶段 3 — Maleoon 硬件加速（9010 / 9020）
++
++**目标**：让 9010 用上 GPU。这是唯一能让 9010 跑游戏的路径。
++
++核心思路：**把 Vulkan 调用搬到 Android 侧执行**。
++
++```
++Linux guest (glibc)                    Android host (bionic)
++┌──────────────────┐                  ┌──────────────────────┐
++│ DXVK / gamescope │                  │ 桥接进程              │
++│      ↓           │   IPC (socket)   │   ↓                  │
++│ libvulkan_bridge │ ←──────────────→ │ 华为 Vulkan 驱动      │
++│  (实现 Vulkan    │   命令流 + 共享  │ (libGLES_maleoon.so) │
++│   ICD 接口)      │   内存/dma-buf   │      ↓               │
++└──────────────────┘                  │  Maleoon 910/920     │
++                                      └──────────────────────┘
++```
++
++技术选项（按可行性排序）：
++
++| 方案 | 原理 | 难度 | 备注 |
++|---|---|---|---|
++| **A. 自建 Vulkan 转发层** | guest 侧实现 ICD，序列化 Vulkan 命令到 host 进程 | 极高 | 类似 Venus/virgl 的思路，需处理同步、内存、fence |
++| **B. 用现成 Venus 协议** | virtio-gpu Venus：guest 侧 `vn_renderer`，host 侧 `vn_icd` | 高 | 需要 virtio-gpu 环境；Android 上无现成宿主 |
++| **C. bionic 兼容层跑 blob** | 在 glibc 下加载 bionic blob（libhybris 路线） | 极高 | ABI、tls、linker 全要适配；且仍需 Android surface |
++| **D. 不做** | 9010 长期软件渲染 | — | 诚实但价值低 |
++
++**建议**：先做 **A 的最小可行版**——只覆盖 DXVK 实际用到的 Vulkan 子集（约 60 个 entrypoint），先跑通"创建 device + 一个三角形"，再逐步补。
++
++**这是独立工程，不应与阶段 1 混在一起排期。**
++
++---
++
++## 阶段 4 — 生态与可持续
++
++| 工作项 | 说明 |
++|---|---|
++| 设备兼容矩阵 | 按 SoC × 后端 × 风险等级维护一张表，随版本发布 |
++| 驱动市场 | 导入的驱动带元数据（适用 SoC、kbase 代次、来源、hash），不匹配则拒绝 |
++| 遥测（可选、匿名） | 仅上报 SoC + GPU + 后端 + 失败点，用于灰度决策 |
++| 上游贡献 | 把 `gpu/probe` 层作为 PR 提给上游，降低长期维护成本 |
++
++---
++
++## 附：当前进度
++
++| 阶段 | 状态 |
++|---|---|
++| 架构层（探测 / 契约 / 策略 / 设备画像） | ✅ 已完成，含单测 |
++| 阶段 1.3–1.7（驱动包、会话接线、UI、报告） | ⬜ 待做，需真机 |
++| 阶段 2（Mali 硬件） | ⬜ 待做 |
++| 阶段 3（Maleoon 桥） | ⬜ 待做，需独立立项 |
++
++> 说明：阶段 1.3 之后的工作全部需要麒麟真机验证。本仓库的架构层之所以做成纯逻辑可单测，就是为了在没有真机的情况下也能把检测与选择做对。
