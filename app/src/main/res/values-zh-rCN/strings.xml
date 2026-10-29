@@ -701,6 +701,8 @@
     <string name="setup_gpu_supported">设备受支持</string>
     <string name="setup_gpu_untested">未经测试的 GPU</string>
     <string name="setup_gpu_unsupported">GPU 不受支持</string>
+    <string name="setup_gpu_software">只能软件渲染</string>
+    <string name="setup_gpu_software_detail">%1$s 没有 Linux 驱动；会话将用 CPU 渲染，游戏会很慢</string>
     <string name="setup_gpu_detail">%1$s · %2$s</string>
     <string name="setup_gpu_untested_detail">%1$s：%2$s</string>
     <string name="setup_gpu_unsupported_detail">Steam 需要 Adreno 驱动；%1$s 可能显示黑屏</string>
@@ -1314,6 +1316,8 @@
     <string name="main_pick_roms">选择 ROM 文件夹</string>
     <string name="main_non_adreno_title">不是 Adreno GPU</string>
     <string name="main_non_adreno_text">Turnip 支持 Adreno GPU。在 %1$s 上，Steam 可能显示黑屏。需下载：%2$.0f MB。</string>
+    <string name="main_software_render_title">此芯片没有 Linux GPU 驱动</string>
+    <string name="main_software_render_text">Turnip 只驱动 Adreno。在 %1$s 上，会话将改用 CPU 软件渲染：启动器与桌面可用，游戏会很慢。请先导入软件 Vulkan 驱动。需下载：%2$.0f MB。</string>
     <string name="main_install_anyway">仍要安装</string>
     <string name="main_remove_runtime_title">移除 Linux 运行时</string>
     <string name="main_remove_runtime_text">这会删除运行时、其中的 Steam 客户端，以及安装在其中的所有游戏。</string>

@@ -324,6 +324,27 @@ object SessionPrefs {
         prefs(context).edit().putString("gpuDriverMode", mode).apply()
     }
 
+    /**
+     * Which render backend the session may use: the stored choice, as one of the three below.
+     *
+     * [GPU_BACKEND_AUTO] is the default for an install that never chose, and it only allows backends
+     * that have been validated. On a device with no validated backend it means CPU rendering - a
+     * slow session that works, rather than a fast one that takes the phone down with it.
+     */
+    const val GPU_BACKEND_AUTO = "auto"
+    const val GPU_BACKEND_HARDWARE = "hardware"
+    const val GPU_BACKEND_SOFTWARE = "software"
+
+    fun gpuBackend(context: Context): String =
+        prefs(context).getString("gpuBackend", GPU_BACKEND_AUTO)
+            ?.takeIf { it in setOf(GPU_BACKEND_AUTO, GPU_BACKEND_HARDWARE, GPU_BACKEND_SOFTWARE) }
+            ?: GPU_BACKEND_AUTO
+
+    fun setGpuBackend(context: Context, mode: String) {
+        require(mode in setOf(GPU_BACKEND_AUTO, GPU_BACKEND_HARDWARE, GPU_BACKEND_SOFTWARE))
+        prefs(context).edit().putString("gpuBackend", mode).apply()
+    }
+
     fun settleGpuDriverMode(context: Context) {
         val p = prefs(context)
         if (p.contains("gpuDriverMode")) return

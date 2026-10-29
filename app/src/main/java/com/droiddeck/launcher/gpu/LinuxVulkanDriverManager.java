@@ -18,7 +18,9 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -45,7 +47,31 @@ public class LinuxVulkanDriverManager {
     public boolean isInstalled(String id) {
         if (id == null || id.isEmpty() || id.contains("/") || id.contains("..")) return false;
         File dir = getDriverDir(id);
-        return new File(dir, LIB_NAME).isFile() && new File(dir, ICD_NAME).isFile();
+        if (!new File(dir, ICD_NAME).isFile()) return false;
+        return libraryOf(dir) != null;
+    }
+
+    /**
+     * The library an install's own manifest points at, if it is still there.
+     *
+     * The manifest is the source of truth rather than a fixed file name: a pack may ship
+     * `libvulkan_lvp.so` or any other name it declared, and only the manifest knows which.
+     */
+    static File libraryOf(File dir) {
+        try {
+            JSONObject body = new JSONObject(FileUtils.readString(new File(dir, ICD_NAME))).optJSONObject("ICD");
+            String path = body != null ? body.optString("library_path", "") : "";
+            if (!path.isEmpty()) {
+                File lib = new File(path);
+                if (!lib.isAbsolute()) lib = new File(dir, path);
+                if (lib.isFile()) return lib;
+            }
+        } catch (Exception ignored) {
+            // Fall through to the historical name below.
+        }
+        // Installs made before packs could name their entry point keep the fixed name.
+        File legacy = new File(dir, LIB_NAME);
+        return legacy.isFile() ? legacy : null;
     }
 
     public String getIcdPath(String id) {
@@ -97,8 +123,11 @@ public class LinuxVulkanDriverManager {
         File tmpDir = newStagingDir();
         boolean keep = false;
         try {
-            String soName = null;
             JSONObject zipMeta = null;
+            // Every shared object in the pack is kept, not just the entry point. A GPU driver pack is
+            // one file (Turnip), but a CPU renderer is not: lavapipe needs its LLVM and its X/Wayland
+            // shims beside it, and the loader has to find them in the same directory.
+            Map<String, File> libs = new LinkedHashMap<>();
             try (InputStream is = context.getContentResolver().openInputStream(zipUri);
                  ZipInputStream zis = new ZipInputStream(is)) {
                 if (is == null) throw new IOException("cannot open " + zipUri);
@@ -107,22 +136,29 @@ public class LinuxVulkanDriverManager {
                     if (entry.isDirectory()) continue;
                     String base = new File(entry.getName()).getName();
                     if (base.isEmpty()) continue;
-                    if (base.startsWith("libvulkan_freedreno") && base.endsWith(".so")) {
-                        if (soName != null) Log.w(TAG, "zip has several libvulkan_freedreno*.so; using the first (" + soName + ")");
-                        else {
-                            Files.copy(zis, new File(tmpDir, LIB_NAME).toPath(), StandardCopyOption.REPLACE_EXISTING);
-                            soName = base;
-                        }
-                    } else if (base.equals(META_NAME)) {
+                    if (base.equals(META_NAME)) {
                         try {
                             zipMeta = new JSONObject(new String(readAll(zis), StandardCharsets.UTF_8));
                         } catch (Exception e) {
                             Log.w(TAG, "meta.json unreadable, ignoring: " + e.getMessage());
                         }
+                    } else if (base.endsWith(".so") || base.contains(".so.")) {
+                        File dst = new File(tmpDir, base);
+                        Files.copy(zis, dst.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                        libs.put(base, dst);
                     }
                 }
             }
-            String id = adopt(tmpDir, soName, zipMeta, displayName);
+            String declared = zipMeta != null ? zipMeta.optString("library", "") : "";
+            String entryName = pickEntry(libs, declared);
+            File entryFile = entryName == null ? null : libs.get(entryName);
+            // Packs that do not name their entry point keep the historical file name, so an existing
+            // Turnip install and a fresh one are laid out the same way.
+            if (entryFile != null && declared.isEmpty() && !entryName.equals(LIB_NAME)) {
+                File renamed = new File(tmpDir, LIB_NAME);
+                if (entryFile.renameTo(renamed)) entryFile = renamed;
+            }
+            String id = adopt(tmpDir, entryFile, entryName, zipMeta, displayName);
             keep = true;
             return id;
         } finally {
@@ -137,12 +173,11 @@ public class LinuxVulkanDriverManager {
         return tmpDir;
     }
 
-    String adopt(File tmpDir, String soName, JSONObject zipMeta, String displayName) throws IOException {
+    String adopt(File tmpDir, File so, String soName, JSONObject zipMeta, String displayName) throws IOException {
         try {
-            if (soName == null) {
+            if (so == null || !so.isFile()) {
                 throw new IllegalArgumentException(context.getString(R.string.lvd_no_library));
             }
-            File so = new File(tmpDir, LIB_NAME);
             if (!isAarch64Elf(so)) {
                 throw new IllegalArgumentException(context.getString(R.string.lvd_not_aarch64, soName));
             }
@@ -167,8 +202,8 @@ public class LinuxVulkanDriverManager {
             JSONObject icd = new JSONObject();
             icd.put("file_format_version", "1.0.0");
             JSONObject icdBody = new JSONObject();
-            icdBody.put("library_path", new File(dir, LIB_NAME).getAbsolutePath());
-            icdBody.put("api_version", "1.1.274");
+            icdBody.put("library_path", new File(dir, so.getName()).getAbsolutePath());
+            icdBody.put("api_version", apiVersion(zipMeta != null ? zipMeta.optString("apiVersion", "") : ""));
             icd.put("ICD", icdBody);
             if (!FileUtils.writeString(new File(tmpDir, ICD_NAME), icd.toString(2))) throw new IOException("cannot write icd.json");
 
@@ -196,6 +231,35 @@ public class LinuxVulkanDriverManager {
         int n = 2;
         while (getDriverDir(id).exists()) id = base + "-" + (n++);
         return id;
+    }
+
+    /**
+     * Which library in the pack the loader should open.
+     *
+     * A pack may name it in meta.json; otherwise the historical Turnip name is used, and failing
+     * that any Vulkan driver in the pack - so a CPU renderer can be imported without a meta.json.
+     */
+    /**
+     * The Vulkan version to declare in the generated manifest.
+     *
+     * This used to be the constant 1.1.274, which was true of every Turnip pack and is not true of
+     * a CPU renderer: a Mesa 26 lavapipe is a 1.4 driver, and a manifest that says 1.1 makes the
+     * loader treat it as one, so a compositor that needs 1.3 reports "no physical device" even
+     * though the driver is loaded and enumerable. The pack states its own version; the old constant
+     * stays as the default so packs published before this field still import unchanged.
+     */
+    static String apiVersion(String declared) {
+        String value = declared == null ? "" : declared.trim();
+        return value.matches("\\d+\\.\\d+\\.\\d+") ? value : DEFAULT_API_VERSION;
+    }
+
+    static final String DEFAULT_API_VERSION = "1.1.274";
+
+    static String pickEntry(Map<String, File> libs, String declared) {
+        if (!declared.isEmpty()) return libs.containsKey(declared) ? declared : null;
+        for (String name : libs.keySet()) if (name.startsWith("libvulkan_freedreno")) return name;
+        for (String name : libs.keySet()) if (name.startsWith("libvulkan_")) return name;
+        return null;
     }
 
     static String sanitizeId(String name) {

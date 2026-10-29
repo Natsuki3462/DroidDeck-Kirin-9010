@@ -1350,9 +1350,18 @@ class FrontEndActivity : ComponentActivity() {
                     onDismiss = { showRoms = false },
                 )
                 showNonAdreno?.let { release ->
+                    // The gate is no longer "is this an Adreno" but "will this draw on the CPU",
+                    // so the card says what will actually happen rather than what the GPU is not.
+                    val softwareOnly = com.droiddeck.launcher.core.DeviceSupport.needsGpuWarning(this@FrontEndActivity)
                     ConfirmDialog(
-                        title = androidx.compose.ui.res.stringResource(R.string.main_non_adreno_title),
-                        text = androidx.compose.ui.res.stringResource(R.string.main_non_adreno_text, com.droiddeck.launcher.core.DeviceSupport.gpuName(this@FrontEndActivity), release.size / 1e6),
+                        title = androidx.compose.ui.res.stringResource(
+                            if (softwareOnly) R.string.main_software_render_title else R.string.main_non_adreno_title
+                        ),
+                        text = androidx.compose.ui.res.stringResource(
+                            if (softwareOnly) R.string.main_software_render_text else R.string.main_non_adreno_text,
+                            com.droiddeck.launcher.core.DeviceSupport.gpuName(this@FrontEndActivity),
+                            release.size / 1e6,
+                        ),
                         confirm = androidx.compose.ui.res.stringResource(R.string.main_install_anyway),
                         onConfirm = { showNonAdreno = null; install(release) },
                         onDismiss = { showNonAdreno = null },
@@ -2431,7 +2440,7 @@ class FrontEndActivity : ComponentActivity() {
             Thread({ checkCatalog() }, "catalog").start()
             return
         }
-        if (installed == null && !com.droiddeck.launcher.core.DeviceSupport.adreno()) { showNonAdreno = release; return }
+        if (installed == null && com.droiddeck.launcher.core.DeviceSupport.needsGpuWarning(this)) { showNonAdreno = release; return }
         install(release)
     }
 
@@ -2446,7 +2455,7 @@ class FrontEndActivity : ComponentActivity() {
             showPhantomGate = true
             return false
         }
-        val warn = installed == null && !com.droiddeck.launcher.core.DeviceSupport.adreno()
+        val warn = installed == null && com.droiddeck.launcher.core.DeviceSupport.needsGpuWarning(this)
         if (warn && available != null) { showNonAdreno = available; return false }
         startActivity(intent)
         return true

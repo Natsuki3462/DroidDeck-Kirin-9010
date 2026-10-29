@@ -701,6 +701,8 @@
     <string name="setup_gpu_supported">裝置受支援</string>
     <string name="setup_gpu_untested">未經測試的 GPU</string>
     <string name="setup_gpu_unsupported">GPU 不受支援</string>
+    <string name="setup_gpu_software">只能軟體算圖</string>
+    <string name="setup_gpu_software_detail">%1$s 沒有 Linux 驅動；工作階段將用 CPU 算圖，遊戲會很慢</string>
     <string name="setup_gpu_detail">%1$s · %2$s</string>
     <string name="setup_gpu_untested_detail">%1$s：%2$s</string>
     <string name="setup_gpu_unsupported_detail">Steam 需要 Adreno 驅動程式；%1$s 可能出現黑畫面。</string>
@@ -1231,6 +1233,8 @@
     <string name="main_pick_roms">選擇 ROM 資料夾</string>
     <string name="main_non_adreno_title">不是 Adreno GPU</string>
     <string name="main_non_adreno_text">Turnip 支援 Adreno GPU。在 %1$s 上，Steam 可能會出現黑畫面。下載大小：%2$.0f MB。</string>
+    <string name="main_software_render_title">此晶片沒有 Linux GPU 驅動</string>
+    <string name="main_software_render_text">Turnip 只驅動 Adreno。在 %1$s 上，工作階段將改用 CPU 軟體算圖：啟動器與桌面可用，遊戲會很慢。請先匯入軟體 Vulkan 驅動。下載大小：%2$.0f MB。</string>
     <string name="main_install_anyway">仍要安裝</string>
     <string name="main_remove_runtime_title">移除 Linux 執行環境</string>
     <string name="main_remove_runtime_text">這會刪除執行環境、其中的 Steam 用戶端，以及安裝在其中的所有遊戲。</string>

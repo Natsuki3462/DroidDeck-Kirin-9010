@@ -189,6 +189,33 @@ object DeviceReport {
         k("KGSL chip id", readSys("/sys/class/kgsl/kgsl-3d0/gpu_chipid"))
         k("System Vulkan ICD", if (File("/vendor/lib64/hw/vulkan.adreno.so").exists()) "/vendor/lib64/hw/vulkan.adreno.so" else "not at the usual path")
 
+        // What the backend layer concluded, in full. This block is the one thing a report from a
+        // device nobody here owns has to carry: on a Kirin there is no kgsl node to read, so without
+        // it the section above would say "unknown" three times and explain nothing.
+        h("GPU backend")
+        runCatching {
+            val probe = com.droiddeck.launcher.gpu.probe.GpuBackends.probe()
+            val policy = com.droiddeck.launcher.gpu.probe.GpuBackends.policy(context)
+            val decision = com.droiddeck.launcher.gpu.probe.BackendRegistry.select(probe, policy)
+            k("Vendor", probe.vendor.label)
+            k("Device", probe.deviceName)
+            probe.kirin?.let { k("SoC", "${it.marketing} · ${it.gpu} · ${it.era.label}") }
+            k("kbase", probe.kbase.label)
+            k("Kernel node", probe.kernelNode ?: "none")
+            k("Vendor driver", probe.driverLib ?: "not at a known path")
+            k("Policy", policy.name)
+            k("Backend", "${decision.chosen.displayName} [${decision.chosen.risk.name}]")
+            k("  why", decision.chosen.reason)
+            k("GPU in guest", if (decision.chosen.gpuInGuest) "yes" else "no (software)")
+            k("  binds", decision.chosen.binds.ifEmpty { listOf("none") }.joinToString(", "))
+            for ((key, value) in decision.chosen.env) k("  env $key", value)
+            for ((key, value) in decision.chosen.dxvk) k("  dxvk $key", value)
+            k("HarmonyOS", com.droiddeck.launcher.gpu.probe.GpuBackends.harmonyOs().label().ifEmpty { "not a HarmonyOS device" })
+            com.droiddeck.launcher.gpu.probe.DeviceProfiles.forProbe(probe, CpuCores.all.size)?.let { tuning ->
+                k("Tuning", "${tuning.label} · ${tuning.resolutionScalePercent}% · ${tuning.maxRefreshHz} Hz")
+            }
+        }.onFailure { k("GPU backend", "probe failed: ${it.message}") }
+
         h("Display")
         k("Session output", SessionState.outputSize?.let { "${it.first}x${it.second}" })
         k("Session refresh", String.format(Locale.US, "%.2f Hz", SessionState.refreshHz))

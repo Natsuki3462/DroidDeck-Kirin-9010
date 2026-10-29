@@ -234,16 +234,22 @@ internal fun SetupPanel(
                 when (tab) {
                     0 -> {
                         val gpuCheck: @Composable (Boolean) -> Unit = { divider ->
+                            // A Maleoon is not "unsupported" in the sense the old wording meant:
+                            // the session does start, on the CPU. Saying so is more useful than
+                            // telling someone their phone needs a Snapdragon.
+                            val maleoon = gpu.family == com.droiddeck.launcher.gpu.GpuInfo.Family.MALEOON
                             CheckRow(
                                 if (gpuOk) CheckState.OK else CheckState.WARN,
-                                when (gpu.support) {
-                                    com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_supported)
-                                    com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested)
+                                when {
+                                    maleoon -> stringResource(R.string.setup_gpu_software)
+                                    gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_supported)
+                                    gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested)
                                     else -> stringResource(R.string.setup_gpu_unsupported)
                                 },
-                                when (gpu.support) {
-                                    com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_detail, gpu.displayName(ctx), gpuName)
-                                    com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested_detail, gpu.displayName(ctx), gpu.supportText(ctx).replaceFirstChar { it.lowercase() })
+                                when {
+                                    maleoon -> stringResource(R.string.setup_gpu_software_detail, gpu.displayName(ctx))
+                                    gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.TESTED -> stringResource(R.string.setup_gpu_detail, gpu.displayName(ctx), gpuName)
+                                    gpu.support == com.droiddeck.launcher.gpu.GpuInfo.Support.UNTESTED -> stringResource(R.string.setup_gpu_untested_detail, gpu.displayName(ctx), gpu.supportText(ctx).replaceFirstChar { it.lowercase() })
                                     else -> stringResource(R.string.setup_gpu_unsupported_detail, gpuName)
                                 },
                                 divider = divider,

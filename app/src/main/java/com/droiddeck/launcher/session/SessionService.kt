@@ -510,7 +510,14 @@ class SessionService : Service() {
                 .onSuccess { if (it != null) Log.i(TAG, it) }
                 .onFailure { Log.w(TAG, "forced components", it) }
         }
-        addClientEnvironment(guest, steamHere, agentEnvironment)
+        // Which driver draws, decided once by the backend layer rather than assumed to be Adreno.
+        // Computed here, before the environment is built, because both the output size and the
+        // guest environment depend on it: on a device whose GPU has no Linux driver this comes back
+        // as a CPU session, which is slower and has to be drawn smaller, and the Adreno-shaped
+        // environment would otherwise point at a driver that cannot initialize there.
+        val gpuPlan = com.droiddeck.launcher.gpu.probe.SessionGpu.plan(this)
+        com.droiddeck.launcher.gpu.probe.SessionGpu.log(gpuPlan)
+        addClientEnvironment(guest, steamHere, agentEnvironment, gpuPlan)
         if (steamHere) guest.add("BL_EPIC_APP_ID=" + com.droiddeck.launcher.stores.epic.EpicClient.shortcutAppId)
         val fastPathAt = guest.size
 
@@ -522,8 +529,11 @@ class SessionService : Service() {
             guest.add("BL_VENC_SOCKET=" + encoder.socket.absolutePath)
         }
 
-        guest.add("BL_WIDTH=" + size.first)
-        guest.add("BL_HEIGHT=" + size.second)
+        // A CPU session cannot fill a 2844x1260 panel at a usable rate, so the device profile says
+        // how much to give up. The compositor scales the result back up, so the session still fills
+        // the screen - it is only drawn smaller.
+        guest.add("BL_WIDTH=" + com.droiddeck.launcher.gpu.probe.SessionGpu.scaledOutput(size.first, gpuPlan.resolutionScalePercent))
+        guest.add("BL_HEIGHT=" + com.droiddeck.launcher.gpu.probe.SessionGpu.scaledOutput(size.second, gpuPlan.resolutionScalePercent))
         if (SessionState.followScreen || size.first < size.second ||
             SessionPrefs.orientation(this) == android.content.pm.ActivityInfo.SCREEN_ORIENTATION_USER)
             guest.add("BL_FOLLOW_OUTPUT=1")
@@ -539,7 +549,12 @@ class SessionService : Service() {
         // The WSI layer goes back to its default count while Steam's Frame Limit holds the game.
         guest.add("GAMESCOPE_WSI_MIN_IMAGE_COUNT=8")
         guest.add("GAMESCOPE_WSI_ENSURE_MIN_IMAGE_COUNT=1")
-        guest.add("BL_REFRESH=" + Math.round(SessionState.refreshHz))
+        val sessionRefresh = if (gpuPlan.maxRefreshHz > 0) {
+            minOf(SessionState.refreshHz, gpuPlan.maxRefreshHz.toFloat())
+        } else {
+            SessionState.refreshHz
+        }
+        guest.add("BL_REFRESH=" + Math.round(sessionRefresh))
         guest.add("BL_LOG=" + sessionLog.path)
         guest.add("BL_DEBUG_DIR=" + sessionDir.path)
 
@@ -750,7 +765,12 @@ class SessionService : Service() {
         return sessionDir
     }
 
-    private fun addClientEnvironment(guest: MutableList<String>, steamHere: Boolean, agentEnvironment: List<String>) {
+    private fun addClientEnvironment(
+        guest: MutableList<String>,
+        steamHere: Boolean,
+        agentEnvironment: List<String>,
+        gpuPlan: com.droiddeck.launcher.gpu.probe.SessionGpuPlan,
+    ) {
         guest.add("/usr/bin/env")
         guest.add("-i")
         guest.add("DROIDDECK_BWRAP_SOCKET=" + com.droiddeck.launcher.runtime.BwrapSpawner.socket(this))
@@ -770,10 +790,21 @@ class SessionService : Service() {
         guest.add("WAYLAND_DISPLAY=wayland-0")
         guest.add("BL_ANDROID_CLIPBOARD=" + File(filesDir, "session/android-clipboard").path)
         guest.add("GAMESCOPE_FORCE_GENERAL_QUEUE=1")
-        guest.add("MESA_LOADER_DRIVER_OVERRIDE=zink")
-        guest.add("GALLIUM_DRIVER=zink")
-        guest.add("LIBGL_KOPPER_DRI2=true")
-        LinuxRuntime.vulkanIcd(this)?.let { guest.add("VK_ICD_FILENAMES=" + it.path) }
+        if (gpuPlan.keepAdrenoDefaults) {
+            guest.add("MESA_LOADER_DRIVER_OVERRIDE=zink")
+            guest.add("GALLIUM_DRIVER=zink")
+            guest.add("LIBGL_KOPPER_DRI2=true")
+        } else {
+            for ((key, value) in gpuPlan.env) guest.add("$key=$value")
+            // A CPU renderer ships with the libraries it links against; the loader only looks in
+            // default paths, so the pack's own directory has to be named. The system paths come
+            // first on purpose: a measured runtime already carries most of these (libxcb, libdrm,
+            // libwayland) and its own builds must win over the older ones inside the pack, which is
+            // then only consulted for what the runtime really lacks.
+            gpuPlan.libraryDir?.let { guest.add("LD_LIBRARY_PATH=/usr/lib:/lib:$it") }
+        }
+        (gpuPlan.icdPath ?: LinuxRuntime.vulkanIcd(this)?.path)
+            ?.let { guest.add("VK_ICD_FILENAMES=" + it) }
         val linuxDriverId = SessionPrefs.linuxDriver(this)
         SessionState.runtimeDriver = linuxDriverId
         com.droiddeck.launcher.gpu.AutoDriverTrial.sessionStarting(
@@ -782,11 +813,16 @@ class SessionService : Service() {
                 ?: SessionPrefs.androidDriver(this),
             linuxDriverId,
         )
-        LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
-            ?.let { guest.add(LinuxVulkanDriver.ENV + "=" + it) }
-        val tuOverride = tuDebugOverride()
-        val tuDriver = sysmemDriver(linuxDriverId)
-        (tuOverride ?: "sysmem".takeIf { tuDriver || SessionPrefs.tuSysmem(this) })?.let { guest.add("TU_DEBUG=$it") }
+        // Turnip's own knobs only mean something when Turnip is the driver. On a software session
+        // BL_VK_DRIVER would override the CPU ICD we just chose, which is the opposite of intended.
+        // They stay declared outside the branch because the game environment below reads them.
+        val tuOverride = if (gpuPlan.software) null else tuDebugOverride()
+        val tuDriver = if (gpuPlan.software) false else sysmemDriver(linuxDriverId)
+        if (!gpuPlan.software) {
+            LinuxVulkanDriver.resolveIcdPath(this, linuxDriverId)
+                ?.let { guest.add(LinuxVulkanDriver.ENV + "=" + it) }
+            (tuOverride ?: "sysmem".takeIf { tuDriver || SessionPrefs.tuSysmem(this) })?.let { guest.add("TU_DEBUG=$it") }
+        }
         if (SessionPrefs.zinkLazy(this)) {
             guest.add("ZINK_DESCRIPTORS=lazy")
             guest.add("ZINK_DEBUG=compact")
