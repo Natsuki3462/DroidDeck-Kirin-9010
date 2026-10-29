@@ -1,3 +1,18 @@
+> **This fork carries a Kirin 9010 (Maleoon 910) support branch.**
+>
+> GPU detection, the user-facing expectations, and CPU-renderer import are in place and verified on
+> hardware. GPU rendering is **not possible** on that chip — there is no Linux driver — and the
+> software path currently stops at gamescope's first Vulkan allocation. Nothing here makes games
+> playable on a Kirin yet.
+>
+> - Full write-up: [`kirin/README.md`](kirin/README.md) · 中文：[`kirin/README.zh-CN.md`](kirin/README.zh-CN.md)
+> - The same work as a patch: [`kirin/patch/`](kirin/patch/)
+> - Framework design and the Kirin roadmap: [`docs/architecture/`](docs/architecture/)
+>
+> Branch `kirin-gpu` carries this work. `main` is upstream, untouched, so a pull request stays clean.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="artwork/droiddeck-banner-dark.svg">
